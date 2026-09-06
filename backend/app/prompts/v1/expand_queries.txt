@@ -1,0 +1,4 @@
+为 GEO DataSets（db=gds）扩展检索词。按 disease/tissue/assay/organism 分组。
+不要做无边界笛卡尔积。每个词标注 origin=model。
+10x Genomics 只能作为 assay 补充信号，不要当作 scRNA-seq 的充分证明。
+只返回 JSON：{"terms":[{"term":"...","group":"disease|tissue|assay|organism","origin":"model"}]}

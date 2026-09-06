@@ -1,0 +1,38 @@
+^SERIES = GSE1000
+!Series_title = Osteosarcoma TE85 cell tissue culture study
+!Series_geo_accession = GSE1000
+!Series_summary = Amino acid conjugated surfaces and controls at 6 and 32 hours
+!Series_overall_design = Time course of TE85 cells on conjugated surfaces
+!Series_type = Expression profiling by array
+!Series_sample_id = GSM15787
+!Series_sample_id = GSM15788
+!Series_relation = SubSeries of: GSE999999
+^PLATFORM = GPL96
+!Platform_title = [HG-U133A] Affymetrix Human Genome U133A Array
+!Platform_geo_accession = GPL96
+^SAMPLE = GSM15787
+!Sample_title = Glutamic Acid Surface 6 hours
+!Sample_geo_accession = GSM15787
+!Sample_organism_ch1 = Homo sapiens
+!Sample_source_name_ch1 = TE85 osteosarcoma cells
+!Sample_characteristics_ch1 = cell line: TE85
+!Sample_characteristics_ch1 = donor_id: D1
+!Sample_characteristics_ch1 = time: 6h
+!Sample_table_begin
+ID_REF	VALUE
+1007_s_at	1.23
+!Sample_table_end
+^SAMPLE = GSM15788
+!Sample_title = Serine Surface 6 hours
+!Sample_geo_accession = GSM15788
+!Sample_organism_ch1 = Homo sapiens
+!Sample_source_name_ch1 = TE85 osteosarcoma cells
+!Sample_characteristics_ch1 = cell line: TE85
+!Sample_characteristics_ch1 = donor_id: D1
+!Sample_characteristics_ch1 = time: 6h
+^SAMPLE = GSM15789
+!Sample_title = Control surface
+!Sample_geo_accession = GSM15789
+!Sample_organism_ch1 = Mus musculus
+!Sample_source_name_ch1 = mouse control
+!Sample_characteristics_ch1 = donor_id: M1

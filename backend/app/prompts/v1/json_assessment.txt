@@ -1,0 +1,8 @@
+每个 inclusion_criteria 的 criterion_id 必须恰好一条 judgement。
+每条必须含字段：criterion_id、verdict、evidence_ids、quote、reason。
+verdict 字段名必须是 verdict，取值只能是 pass、fail、unknown，不得省略、不得写成 maybe 或其他词。
+根对象必须是：
+{"judgements":[{"criterion_id":"","verdict":"pass|fail|unknown","evidence_ids":[],"quote":"","reason":""}],"concerns":[],"missing":[]}
+不要包在 assessments、assess_dataset、assess_result、verify_result 或其他键里。
+quote 必须是对应证据或 samples[] 原文的连续子串，不能改写。
+pass/fail 必须引用输入中存在的 evidence_id。

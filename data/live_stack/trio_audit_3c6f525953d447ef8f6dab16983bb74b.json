@@ -1,0 +1,265 @@
+{
+  "run_id": "3c6f525953d447ef8f6dab16983bb74b",
+  "status": "completed",
+  "stop_reason": "正常结束",
+  "token_usage": {
+    "prompt_tokens": 33389,
+    "completion_tokens": 2005
+  },
+  "started_at": "2026-09-06 04:37:51.594411",
+  "finished_at": "2026-09-06 04:38:25.253826",
+  "db_categories": {
+    "GSE333565": "needs_review",
+    "GSE325203": "needs_review",
+    "GSE1000": "excluded"
+  },
+  "api_categories": {
+    "GSE333565": "needs_review",
+    "GSE325203": "needs_review",
+    "GSE1000": "excluded"
+  },
+  "excel_categories": {
+    "GSE333565": "needs_review",
+    "GSE325203": "needs_review",
+    "GSE1000": "excluded"
+  },
+  "excel_headers": [
+    "GSE",
+    "标题",
+    "官方链接",
+    "PMID",
+    "物种",
+    "组织",
+    "疾病",
+    "技术",
+    "平台",
+    "GSM数",
+    "已确认供体数",
+    "分组与组内供体",
+    "细胞数",
+    "对照类型",
+    "临床字段",
+    "处理后数据",
+    "原始数据",
+    "最终类别",
+    "硬条件未知数",
+    "软条件满足度",
+    "核验完成状态",
+    "理由",
+    "疑点",
+    "相关系列",
+    "人工覆盖",
+    "采用GSM子集",
+    "未知硬条件"
+  ],
+  "verification": {
+    "GSE333565": "needs_review",
+    "GSE325203": "needs_review",
+    "GSE1000": "needs_review"
+  },
+  "reasons": {
+    "GSE333565": "复核失败：模型输出不符合契约，不是科研信息不足。",
+    "GSE325203": "复核失败：模型输出不符合契约，不是科研信息不足。",
+    "GSE1000": "硬条件失败: assay"
+  },
+  "soft_source": {
+    "GSE333565": "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE333nnn/GSE333565/soft/GSE333565_family.soft.gz",
+    "GSE325203": "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE325nnn/GSE325203/soft/GSE325203_family.soft.gz",
+    "GSE1000": "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE1nnn/GSE1000/soft/GSE1000_family.soft.gz"
+  },
+  "deep_or_soft_gse": [
+    "GSE1000",
+    "GSE325203",
+    "GSE333565"
+  ],
+  "soft_events": [
+    "GSE1000 SOFT 元数据已解析，样本 7，截断=True",
+    "GSE333565 SOFT 元数据已解析，样本 18，截断=False",
+    "GSE325203 SOFT 元数据已解析，样本 11，截断=False"
+  ],
+  "assess_model_gse": [
+    "GSE1000",
+    "GSE325203",
+    "GSE333565"
+  ],
+  "verify_model_gse": [
+    "GSE1000",
+    "GSE325203",
+    "GSE333565"
+  ],
+  "llm_only_on_deep": true,
+  "summary_screened_got_llm": [],
+  "repair_events": [],
+  "invalid_events": [
+    "GSE333565 首次模型核验无效: 模型输出未通过 schema 校验: 1 validation error for ModelAssessment\njudgements\n  Field required [type=missing, input_value={'inclusion_criteria_eval..., 'evidence_id': None}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.11/v/missing",
+    "GSE325203 首次模型核验无效: 模型输出未通过 schema 校验: 1 validation error for ModelAssessment\njudgements\n  Field required [type=missing, input_value={'inclusion_criteria_eval...', 'evidence_id': []}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.11/v/missing",
+    "GSE1000 首次模型核验无效: 模型输出未通过 schema 校验: 1 validation error for ModelAssessment\njudgements\n  Field required [type=missing, input_value={'inclusion_criteria': [{...n', 'evidence_id': []}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.11/v/missing"
+  ],
+  "gse333565_category": "needs_review",
+  "gse333565_hard": {
+    "organism": {
+      "verdict": "pass",
+      "evidence_ids": [
+        "ev_57818916771d53ac",
+        "ev_1ed1306654e103f4",
+        "ev_e577a78cd33b8429",
+        "ev_008dd32a5828770f",
+        "ev_b163ba02158b9ab7",
+        "ev_8cf27eae18e874a3",
+        "ev_69c38e7d90878f4b",
+        "ev_c18c72d5a3033991"
+      ],
+      "qualifying_gsms": [
+        "GSM9769232",
+        "GSM9769233",
+        "GSM9769234",
+        "GSM9769235",
+        "GSM9769236",
+        "GSM9769237",
+        "GSM9769238",
+        "GSM9769239",
+        "GSM9769240",
+        "GSM9769241",
+        "GSM9769242",
+        "GSM9769243",
+        "GSM9769244",
+        "GSM9769245",
+        "GSM9769246",
+        "GSM9769247",
+        "GSM9769248",
+        "GSM9769249",
+        "GSM9769201",
+        "GSM9769202",
+        "GSM9769203",
+        "GSM9769204",
+        "GSM9769205",
+        "GSM9769206"
+      ],
+      "quote": "",
+      "reason": "样本物种均匹配。"
+    },
+    "assay": {
+      "verdict": "unknown",
+      "evidence_ids": [],
+      "qualifying_gsms": [],
+      "quote": "",
+      "reason": "模型未完成有效核验；不继承弱关键词规则的 pass。 规则说明：是高通量表达谱，但缺少单细胞直接描述。"
+    },
+    "disease": {
+      "verdict": "unknown",
+      "evidence_ids": [],
+      "qualifying_gsms": [],
+      "quote": "",
+      "reason": "模型未完成有效核验；不继承弱关键词规则的 pass。 规则说明：文本出现相关词。"
+    },
+    "groups": {
+      "verdict": "unknown",
+      "evidence_ids": [],
+      "qualifying_gsms": [],
+      "quote": "",
+      "reason": "模型未完成有效核验；不继承弱关键词规则的 pass。 规则说明：样本特征字段给出所需分组。"
+    }
+  },
+  "gse325203_category": "needs_review",
+  "gse325203_reason": "复核失败：模型输出不符合契约，不是科研信息不足。",
+  "gse1000_category": "excluded",
+  "category_consistent": true,
+  "key_leaks": 0,
+  "export": {
+    "id": "baf2edd442de4c39b2316d973ba91343",
+    "filename": "GEOScout_ds-live-fixed-trio_20260906T043826Z.xlsx",
+    "complete": true,
+    "download": "/api/exports/baf2edd442de4c39b2316d973ba91343/download",
+    "status": "completed",
+    "stop_reason": "正常结束"
+  },
+  "xlsx": "D:\\vesscular data\\geoscout\\data\\exports\\3c6f525953d447ef8f6dab16983bb74b\\GEOScout_ds-live-fixed-trio_20260906T043826Z.xlsx",
+  "job_steps": [
+    {
+      "step": "plan",
+      "status": "done"
+    },
+    {
+      "step": "search",
+      "status": "done"
+    },
+    {
+      "step": "fetch_summaries",
+      "status": "done"
+    },
+    {
+      "step": "screen",
+      "status": "done"
+    },
+    {
+      "step": "deep_fetch",
+      "status": "done"
+    },
+    {
+      "step": "deep_fetch",
+      "status": "done"
+    },
+    {
+      "step": "deep_fetch",
+      "status": "done"
+    },
+    {
+      "step": "deep_fetch",
+      "status": "done"
+    },
+    {
+      "step": "assess",
+      "status": "done"
+    },
+    {
+      "step": "assess",
+      "status": "done"
+    },
+    {
+      "step": "assess",
+      "status": "done"
+    },
+    {
+      "step": "assess",
+      "status": "done"
+    },
+    {
+      "step": "verify",
+      "status": "leased"
+    },
+    {
+      "step": "verify",
+      "status": "done"
+    },
+    {
+      "step": "verify",
+      "status": "done"
+    },
+    {
+      "step": "verify",
+      "status": "done"
+    },
+    {
+      "step": "verify",
+      "status": "done"
+    },
+    {
+      "step": "finalize",
+      "status": "done"
+    }
+  ],
+  "event_tail": [
+    "任务已排队",
+    "已规划 1 条检索式（非穷尽）",
+    "查询完成：命中 3，待摘要 UID 3",
+    "摘要完成：新增唯一 GSE 3，跳过非 GSE {'GDS': 0, 'GPL': 0, 'GSM': 0, 'other': 0}",
+    "规则初筛完成，3 条 GSE",
+    "GSE1000 SOFT 元数据已解析，样本 7，截断=True",
+    "GSE333565 SOFT 元数据已解析，样本 18，截断=False",
+    "GSE325203 SOFT 元数据已解析，样本 11，截断=False",
+    "GSE333565 首次模型核验无效: 模型输出未通过 schema 校验: 1 validation error for ModelAssessment\njudgements\n  Field required [type=missing, input_value={'inclusion_criteria_eval..., 'evidence_id': None}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.11/v/missing",
+    "GSE325203 首次模型核验无效: 模型输出未通过 schema 校验: 1 validation error for ModelAssessment\njudgements\n  Field required [type=missing, input_value={'inclusion_criteria_eval...', 'evidence_id': []}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.11/v/missing",
+    "GSE1000 首次模型核验无效: 模型输出未通过 schema 校验: 1 validation error for ModelAssessment\njudgements\n  Field required [type=missing, input_value={'inclusion_criteria': [{...n', 'evidence_id': []}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.11/v/missing",
+    "任务结束：completed，唯一 GSE 3"
+  ]
+}

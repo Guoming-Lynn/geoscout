@@ -1,0 +1,3 @@
+独立复核。不要读取或假设首次核验结论。只阅读本消息中的 spec、summary、samples[] 与 evidence。
+对每个 inclusion_criteria 重新给出 pass/fail/unknown，判断规则与首次核验相同。
+JSON 字段定义见下文，必须遵守。

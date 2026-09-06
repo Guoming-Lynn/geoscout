@@ -1,0 +1,6 @@
+将用户课题解析为 JSON。无法确定的字段留空或列入 unresolved_questions，不要擅自补全。
+区分必须条件与最好条件。对照类型若未说明，不要把健康供体、邻近组织、未处理、假手术视为等价。
+输出字段：disease, tissues, organisms, assay_types, required_groups, minimum_donors_per_group,
+paired_design, required_metadata, preferred_metadata, processed_matrix_requirement, unresolved_questions。
+assay_types 只能是 bulk_rna_seq, scrna_seq, snrna_seq。
+organisms 使用 Homo sapiens 或 Mus musculus。

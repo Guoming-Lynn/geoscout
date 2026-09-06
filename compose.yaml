@@ -1,0 +1,38 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      GEOSCOUT_HOST: 0.0.0.0
+      GEOSCOUT_DATA_DIR: /data
+      GEOSCOUT_NCBI_MODE: live
+      GEOSCOUT_LLM_MODE: live
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - geoscout-data:/data
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      GEOSCOUT_HOST: 0.0.0.0
+      GEOSCOUT_DATA_DIR: /data
+      GEOSCOUT_API_URL: http://api:8000
+    command: python -m app.worker
+    volumes:
+      - geoscout-data:/data
+    depends_on:
+      - api
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "127.0.0.1:5173:80"
+    depends_on:
+      - api
+volumes:
+  geoscout-data:

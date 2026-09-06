@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=69.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geoscout"
+version = "0.1.0"
+description = "Local GEO dataset discovery and evidence-backed screening"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "GEOScout contributors" }]
+dependencies = [
+  "fastapi==0.115.12",
+  "uvicorn[standard]==0.34.2",
+  "pydantic==2.11.3",
+  "pydantic-settings==2.8.1",
+  "sqlalchemy==2.0.40",
+  "aiosqlite==0.21.0",
+  "alembic==1.15.2",
+  "httpx==0.28.1",
+  "openpyxl==3.1.5",
+  "python-multipart==0.0.20",
+  "orjson==3.10.16",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.5",
+  "pytest-asyncio==0.25.3",
+  "respx==0.22.0",
+]
+
+[project.scripts]
+geoscout-api = "app.main:run"
+geoscout-worker = "app.worker:run"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["prompts/v1/*.txt"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = [
+  "network: hits real NCBI endpoints (not default CI)",
+  "llm_live: hits a real model endpoint when a key is configured",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

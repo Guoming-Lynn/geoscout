@@ -1,0 +1,31 @@
+from app.schemas.spec import (
+    Budget,
+    Category,
+    ConnectionConfigIn,
+    Criterion,
+    CriterionJudgement,
+    ExportIn,
+    ModelAssessment,
+    OverrideIn,
+    PlannedQuery,
+    ProjectCreate,
+    ResearchSpec,
+    RunCreate,
+    TermEntry,
+)
+
+__all__ = [
+    "Budget",
+    "Category",
+    "ConnectionConfigIn",
+    "Criterion",
+    "CriterionJudgement",
+    "ExportIn",
+    "ModelAssessment",
+    "OverrideIn",
+    "PlannedQuery",
+    "ProjectCreate",
+    "ResearchSpec",
+    "RunCreate",
+    "TermEntry",
+]
