@@ -195,7 +195,6 @@ def test_chiapet_is_not_chipseq():
     judged = _method(spec, {"title": "ChIA-PET of human cortex"})
     assert judged.verdict != "pass"
 
-
 def test_shared_protocol_does_not_qualify_rna_seq_as_atac():
     spec = heuristic_parse("human intestinal tissue ATAC-seq")
     shared = "RNA-seq and ATAC-seq libraries were prepared in this study."
