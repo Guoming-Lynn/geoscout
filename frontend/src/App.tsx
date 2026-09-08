@@ -59,6 +59,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [conn, setConn] = useState<Conn>(defaultConn);
   const [entered, setEntered] = useState(() => hadWorkbench());
   const session = useQuery({ queryKey: ["connections"], queryFn: api.connections });
@@ -222,7 +223,7 @@ export default function App() {
                   await api.saveConnections(body);
                   const r = await api.testConnections(body);
                   setConn({ ...conn, llm_api_key: "", ncbi_api_key: "" });
-                  setError(r && (r as { message?: string }).message ? String((r as { message?: string }).message) : t("testConn"));
+                  setNotice(r && (r as { message?: string }).message ? String((r as { message?: string }).message) : t("testConn"));
                   qc.invalidateQueries({ queryKey: ["connections"] });
                 } catch (e) {
                   setError((e as Error).message);
@@ -248,7 +249,7 @@ export default function App() {
                 setSelected(null);
                 setSpec(emptySpec);
                 setRequest("");
-                setError(t("cleared"));
+                setNotice(t("cleared"));
                 qc.invalidateQueries({ queryKey: ["projects"] });
                 qc.invalidateQueries({ queryKey: ["runs"] });
               } catch (e) {
@@ -283,6 +284,7 @@ export default function App() {
             {t("banner", { ncbi: health.data.ncbi_mode, llm: health.data.llm_mode })}
           </div>
         )}
+        {notice && <div className="notice" role="status">{notice}</div>}
         {error && <div className="error" role="alert">{error}</div>}
         {(starting || current) && (
           <div

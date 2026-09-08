@@ -11,6 +11,8 @@
 
 ![GEOScout product poster](docs/assets/geoscout-github-poster-light-v2.png)
 
+*The poster is a visual concept of the workbench information architecture. Labels, scores, dates, counts and example records shown in the artwork are illustrative; the live preview uses the actual app controls and Excel export described below.*
+
 GEOScout is a local tool for finding and screening datasets in NCBI GEO. Turn a research question into structured criteria, retrieve candidate studies, inspect sample-level evidence, and export a workbook for human review. Use your own model provider, or start with manual NCBI search without a model key.
 
 **Research question → Structured criteria → GEO search → Evidence review → Excel export**
@@ -53,10 +55,7 @@ If port 8000 is occupied, stop the previous GEOScout, uvicorn or Vite process fi
 
 The first screen is the connection page. Test a model key, or enter using NCBI-only search.
 
-API：[http://127.0.0.1:8000/api/health](http://127.0.0.1:8000/api/health)
-
-
-## Without a model key
+API: [http://127.0.0.1:8000/api/health](http://127.0.0.1:8000/api/health)
 
 
 ## Model keys
@@ -96,7 +95,13 @@ npm run test:e2e
 
 ## Documentation
 
+The detailed walkthroughs are currently maintained in Chinese:
 
+- [Quickstart](docs/quickstart.md)
+- [Architecture](docs/architecture.md)
+- [Validation scope](docs/validation.md)
+- [Research preview](docs/release-preview.md)
+- [Security](SECURITY.md)
 ## Author
 
 [Guoming Lin](https://github.com/Guoming-Lynn)

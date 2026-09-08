@@ -177,6 +177,7 @@ tbody tr:hover { background: #f5fafc; }
 .detail-drawer .detail { margin-top: 0; border-top: 0; padding-top: 0; }
 .drawer-close { position: sticky; top: 0; float: right; z-index: 1; padding: 4px 10px; font-size: 20px; }
 .error { color: var(--bad); }
+.notice { color: var(--ok); background: #e8f5ee; border: 1px solid #b7d7c4; border-radius: 9px; padding: 8px 10px; margin-bottom: 12px; }
 .gate {
   min-height: 100%;
   display: grid;
