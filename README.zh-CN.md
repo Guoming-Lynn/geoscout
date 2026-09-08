@@ -1,30 +1,14 @@
 # GEOScout
 
-<div align="center">
+**发现 GEO 数据集，让筛选依据可复查。**
 
-**GEO dataset discovery, with evidence you can review.**
-
-**English** · [简体中文](README.zh-CN.md)
-
-[![CI](https://github.com/Guoming-Lynn/geoscout/actions/workflows/ci.yml/badge.svg)](https://github.com/Guoming-Lynn/geoscout/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-10b981)](LICENSE) ![Status: Research preview](https://img.shields.io/badge/Status-Research%20preview-0891b2)
-
-</div>
+[English](README.md) · **简体中文**
 
 ![GEOScout product poster](docs/assets/geoscout-github-poster-light.png)
 
-GEOScout is a local tool for finding and screening datasets in NCBI GEO. Turn a research question into structured criteria, retrieve candidate studies, inspect sample-level evidence, and export a workbook for human review. Use your own model provider, or start with manual NCBI search without a model key.
+Local GEO dataset discovery and screening. You bring your own model key. GEOScout expands search terms, talks to NCBI GEO, double-checks with evidence, and exports a reviewable Excel workbook.
 
-**Research question → Structured criteria → GEO search → Evidence review → Excel export**
-
-| Step | What you can do |
-| --- | --- |
-| Define | Inspect disease, organism, tissue, assay and sample-source constraints. |
-| Discover | Search GEO with topic terms and optional model-assisted query expansion. |
-| Review | Inspect sample-level evidence and recommendation reasons. |
-| Control | Choose Low, Medium, High or Ultra intensity; pause, resume or cancel. |
-| Export | Keep decisions, evidence and applicable GSMs in a reviewable workbook. |
-
-For the full Chinese walkthrough, see [README.zh-CN.md](README.zh-CN.md).
+本地运行的 GEO 数据集发现与核验工具。用户自备模型 Key，系统扩展检索词、访问 NCBI GEO、用证据做二次检查，并导出可复查的 Excel。
 
 **不承诺穷尽全部 GEO、零漏检，或自动证明某数据集可用于特定科研结论。**
 
