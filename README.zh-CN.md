@@ -4,7 +4,7 @@
 
 [English](README.md) · **简体中文**
 
-![GEOScout product poster](docs/assets/geoscout-github-poster-light.png)
+![GEOScout product poster](docs/assets/geoscout-github-poster-light-v2.png)
 
 Local GEO dataset discovery and screening. You bring your own model key. GEOScout expands search terms, talks to NCBI GEO, double-checks with evidence, and exports a reviewable Excel workbook.
 
