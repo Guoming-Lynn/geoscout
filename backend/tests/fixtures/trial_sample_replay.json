@@ -1,0 +1,210 @@
+{
+  "source": "data/disease-live-lowmed-20260908/runtime/geoscout.db",
+  "note": "CI fallback uses the same sample_record fields as production. GSE226875 protocol is a synthetic shared-library overlay, not the original GEO extract.",
+  "series": {
+    "GSE282442": {
+      "study": {
+        "title": "Epigenetic Memory of Intestinal Epithelial Cells in Inflammatory Bowel Disease [ATAC-seq]",
+        "taxon": "Homo sapiens",
+        "gdstype": "Genome binding/occupancy profiling by high throughput sequencing"
+      },
+      "strategy_counts": {
+        "ATAC-seq": 26
+      },
+      "samples": [
+        {
+          "gsm": "GSM8643263",
+          "title": "Subject 83 Inflamed Rep 1",
+          "organism": "Homo sapiens",
+          "source_name": "Colon",
+          "library_strategy": "ATAC-seq",
+          "library_source": "",
+          "protocol": "",
+          "protocol_fields": {},
+          "characteristics": []
+        },
+        {
+          "gsm": "GSM8643264",
+          "title": "Subject 115 Noninflamed Rep 1",
+          "organism": "Homo sapiens",
+          "source_name": "Colon",
+          "library_strategy": "ATAC-seq",
+          "library_source": "",
+          "protocol": "",
+          "protocol_fields": {},
+          "characteristics": []
+        }
+      ]
+    },
+    "GSE307633": {
+      "study": {
+        "title": "scATACseq of sorted stromal cell compartment from patients with Crohn's disease",
+        "taxon": "Homo sapiens",
+        "gdstype": "Genome binding/occupancy profiling by high throughput sequencing"
+      },
+      "strategy_counts": {
+        "ATAC-seq": 13
+      },
+      "samples": [
+        {
+          "gsm": "GSM9228374",
+          "title": "CD45-EPCAM- stromal cells_110544",
+          "organism": "Homo sapiens",
+          "source_name": "intestine",
+          "library_strategy": "ATAC-seq",
+          "library_source": "",
+          "protocol": "",
+          "protocol_fields": {},
+          "characteristics": []
+        },
+        {
+          "gsm": "GSM9228375",
+          "title": "CD45-EPCAM- stromal cells_110543",
+          "organism": "Homo sapiens",
+          "source_name": "intestine",
+          "library_strategy": "ATAC-seq",
+          "library_source": "",
+          "protocol": "",
+          "protocol_fields": {},
+          "characteristics": []
+        }
+      ]
+    },
+    "GSE319550": {
+      "study": {
+        "title": "Chromatin accessibility in human colonic fibroblasts",
+        "taxon": "Homo sapiens",
+        "gdstype": "Genome binding/occupancy profiling by high throughput sequencing"
+      },
+      "strategy_counts": {
+        "ATAC-seq": 9
+      },
+      "samples": [
+        {
+          "gsm": "GSM9519646",
+          "title": "HCoF Mid-old replicate 1",
+          "organism": "Homo sapiens",
+          "source_name": "Colon",
+          "library_strategy": "ATAC-seq",
+          "library_source": "",
+          "protocol": "",
+          "protocol_fields": {},
+          "characteristics": []
+        },
+        {
+          "gsm": "GSM9519647",
+          "title": "HCoF Mid-old replicate 2",
+          "organism": "Homo sapiens",
+          "source_name": "Colon",
+          "library_strategy": "ATAC-seq",
+          "library_source": "",
+          "protocol": "",
+          "protocol_fields": {},
+          "characteristics": []
+        }
+      ]
+    },
+    "GSE332645": {
+      "study": {
+        "title": "Histone ChIP-seq from transverse colon (ENCSR208QRN)",
+        "taxon": "Homo sapiens",
+        "gdstype": "Genome binding/occupancy profiling by high throughput sequencing"
+      },
+      "strategy_counts": {
+        "ChIP-Seq": 4
+      },
+      "samples": [
+        {
+          "gsm": "GSM9751819",
+          "title": "Histone ChIP-seq from transverse colon (ENCLB169IZI)",
+          "organism": "Homo sapiens",
+          "source_name": "Homo sapiens transverse colon tissue female adult (53 years)",
+          "library_strategy": "ChIP-Seq",
+          "library_source": "",
+          "protocol": "",
+          "protocol_fields": {},
+          "characteristics": []
+        },
+        {
+          "gsm": "GSM9751820",
+          "title": "Histone ChIP-seq from transverse colon (ENCLB836GCN)",
+          "organism": "Homo sapiens",
+          "source_name": "Homo sapiens transverse colon tissue female adult (53 years)",
+          "library_strategy": "ChIP-Seq",
+          "library_source": "",
+          "protocol": "",
+          "protocol_fields": {},
+          "characteristics": []
+        }
+      ]
+    },
+    "GSE315662": {
+      "study": {
+        "title": "ACSS2-Mediated Lysine Crotonylation Attenuates Senescence and Enhances the Therapeutic Efficacy of Adipose-derived Stem Cells in Inflammatory Bowel Disease [ChIP-Seq]",
+        "taxon": "Homo sapiens",
+        "gdstype": "Genome binding/occupancy profiling by high throughput sequencing"
+      },
+      "strategy_counts": {
+        "ChIP-Seq": 4
+      },
+      "samples": [
+        {
+          "gsm": "GSM9434160",
+          "title": "P3_H3K9cr_ChIP",
+          "organism": "Homo sapiens",
+          "source_name": "cell line",
+          "library_strategy": "ChIP-Seq",
+          "library_source": "",
+          "protocol": "",
+          "protocol_fields": {},
+          "characteristics": []
+        },
+        {
+          "gsm": "GSM9434161",
+          "title": "P7_H3K9cr_ChIP",
+          "organism": "Homo sapiens",
+          "source_name": "cell line",
+          "library_strategy": "ChIP-Seq",
+          "library_source": "",
+          "protocol": "",
+          "protocol_fields": {},
+          "characteristics": []
+        }
+      ]
+    },
+    "GSE226875": {
+      "study": {
+        "title": "The chromatin and single-cell transcriptional landscapes of CD4 T cells in inflammatory bowel disease link risk loci with a proinflammatory Th17 cell population",
+        "taxon": "Homo sapiens",
+        "gdstype": "Expression profiling by high throughput sequencing"
+      },
+      "strategy_counts": {
+        "RNA-Seq": 6
+      },
+      "samples": [
+        {
+          "gsm": "GSM7086233",
+          "title": "G05, P1, noninflamed",
+          "organism": "Homo sapiens",
+          "source_name": "Non-inflamed biopsy",
+          "library_strategy": "RNA-Seq",
+          "library_source": "",
+          "protocol": "RNA-seq and ATAC-seq libraries were prepared in this study.",
+          "protocol_fields": {},
+          "characteristics": []
+        },
+        {
+          "gsm": "GSM7086234",
+          "title": "G06, P1, inflamed",
+          "organism": "Homo sapiens",
+          "source_name": "Inflamed biopsy",
+          "library_strategy": "RNA-Seq",
+          "library_source": "",
+          "protocol": "RNA-seq and ATAC-seq libraries were prepared in this study.",
+          "protocol_fields": {},
+          "characteristics": []
+        }
+      ]
+    }
+  }
+}

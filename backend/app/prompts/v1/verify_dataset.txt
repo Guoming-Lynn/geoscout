@@ -1,3 +1,4 @@
-独立复核。不要读取或假设首次核验结论。只阅读本消息中的 spec、summary、samples[] 与 evidence。
+独立复核。不要读取或假设首次核验结论，也不要为了与首次结果一致而调整判断。只阅读本消息中的 spec、summary、samples[] 与 evidence；重新核对每个 quote 是否支持 verdict，引用不存在或覆盖不完整时必须降为 unknown。
 对每个 inclusion_criteria 重新给出 pass/fail/unknown，判断规则与首次核验相同。
+重点复查两类错误：把明确的病例缩写误当未知；把治疗对照或不同技术/来源样本拼接成病例对照。对每个 groups 的 pass，逐一检查 qualifying_gsms 能否在输入找到，是否实际覆盖病例与对照，引用是否来自相应样本。已有输入可回答时应作出判断；输入不足时具体指出缺口。
 JSON 字段定义见下文，必须遵守。

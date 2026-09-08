@@ -3,7 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 from app.pipeline.assessment import ABSTRACT_CANNOT_FAIL
+from app.pipeline.assay import TYPED_NONRNA, assay_method_relation, assay_relation, infer_sample_assay, infer_study_assay, sample_method_relation
 from app.pipeline.donors import donor_criterion_judgement, infer_group_label
+from app.pipeline.lexicon import lexicon_terms
+from app.pipeline.source import sample_tissue_conflicts, source_kind, tissue_matches
+from app.pipeline.spec_parse import disease_parse_incomplete
 from app.schemas.spec import Criterion, CriterionJudgement, ResearchSpec, Verdict
 
 RNASEQ_GTYP = "expression profiling by high throughput sequencing"
@@ -20,6 +24,15 @@ BULK_HINTS = ["bulk rna", "bulk rna-seq", "bulk transcriptome"]
 TENX_HINTS = ["10x", "10x genomics"]
 AGE_KEYS = {"age", "age (years)", "age_years", "age (yrs)", "donor age", "patient age", "age (y)"}
 SEX_KEYS = {"sex", "gender", "biological sex", "sex (female/male)", "donor sex"}
+
+
+def _sample_has_keys(sample: dict[str, Any], keys: set[str]) -> bool:
+    for row in sample.get("characteristics") or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("key") or "").lower() in keys and str(row.get("value") or "").strip():
+            return True
+    return False
 
 
 def rule_judgements(
@@ -50,10 +63,14 @@ def _judge_one(
         return _organism(criterion, summary, samples)
     if field == "assay":
         return _assay(criterion, summary, samples, text)
+    if field == "assay_method":
+        return _assay_method(criterion, spec, summary, samples)
     if field == "disease":
-        return _keyword(criterion, text, spec.disease, hard_fail=False)
+        return _keyword(criterion, text, _disease_seeds(spec), hard_fail=False)
     if field == "tissue":
-        return _keyword(criterion, text, spec.tissues, hard_fail=False)
+        return _tissue(criterion, spec, samples, text)
+    if field == "sample_source":
+        return _sample_source(criterion, spec, samples)
     if field == "groups":
         return _groups(criterion, spec, text, samples)
     if field == "donors":
@@ -85,7 +102,7 @@ def _organism(criterion: Criterion, summary: dict[str, Any], samples: list[dict[
         matching = [s for s in labeled if matches(str(s.get("organism") or ""))]
         other = [s for s in labeled if not matches(str(s.get("organism") or ""))]
         gsms = [str(s.get("gsm") or "") for s in matching if s.get("gsm")]
-        if matching and not other:
+        if matching and not other and len(labeled) == len(samples):
             return CriterionJudgement(
                 criterion_id=criterion.criterion_id,
                 verdict="pass",
@@ -94,7 +111,7 @@ def _organism(criterion: Criterion, summary: dict[str, Any], samples: list[dict[
                 support_text=str(matching[0].get("organism") or ""),
                 qualifying_gsms=gsms,
             )
-        if matching and other:
+        if matching and (other or len(labeled) != len(samples)):
             return CriterionJudgement(
                 criterion_id=criterion.criterion_id,
                 verdict="unknown",
@@ -104,7 +121,7 @@ def _organism(criterion: Criterion, summary: dict[str, Any], samples: list[dict[
                 qualifying_gsms=gsms,
                 clue_only=True,
             )
-        if labeled and not matching:
+        if labeled and not matching and len(labeled) == len(samples):
             taxa = sorted({str(s.get("organism")) for s in labeled})
             return CriterionJudgement(
                 criterion_id=criterion.criterion_id,
@@ -113,6 +130,9 @@ def _organism(criterion: Criterion, summary: dict[str, Any], samples: list[dict[
                 judge_source="rule",
                 support_text="; ".join(taxa),
             )
+        if len(labeled) != len(samples):
+            return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="unknown", clue_only=True,
+                                      reason="部分样本缺少物种，不能证明全部样本不符。", judge_source="rule")
     taxon = str(summary.get("taxon") or "")
     if not taxon:
         return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="unknown", reason="摘要未提供物种。", judge_source="rule")
@@ -182,8 +202,15 @@ def _assay(criterion: Criterion, summary: dict[str, Any], samples: list[dict[str
     has_tenx = any(h.lower() in blob for h in TENX_HINTS)
     is_rnaseq = RNASEQ_GTYP in gdstype
     mixed_tech = has_scrna and has_bulk
-    wants_rnaseq = any(w in {"scrna_seq", "snrna_seq", "bulk_rna_seq"} for w in wanted)
-    if wants_rnaseq and "profiling by array" in gdstype:
+    wants_rnaseq = any(w in {"scrna_seq", "snrna_seq", "bulk_rna_seq", "rna_seq_generic"} for w in wanted)
+    detected = infer_study_assay({**summary, "gdstype": gdstype})
+    rel = assay_relation(wanted, detected)
+    if wants_rnaseq and "array" in gdstype:
+        if is_rnaseq or any("rna-seq" in str(s.get("library_strategy") or "").lower() for s in samples):
+            return CriterionJudgement(
+                criterion_id=criterion.criterion_id, verdict="unknown", clue_only=True,
+                reason="研究同时包含芯片和测序，需核验 RNA-seq 样本子集，不能整体排除。", judge_source="rule",
+            )
         return CriterionJudgement(
             criterion_id=criterion.criterion_id,
             verdict="fail",
@@ -192,8 +219,47 @@ def _assay(criterion: Criterion, summary: dict[str, Any], samples: list[dict[str
             support_text=_flatten_text(summary.get("gdstype") or summary.get("type") or ""),
         )
 
+    if rel == "contradict" and detected.confidence == "explicit":
+        shown = "、".join(detected.kinds or ((detected.kind,) if detected.kind else ()))
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="fail",
+            reason=f"研究技术为 {shown}，与要求 {','.join(wanted)} 直接冲突。",
+            judge_source="rule",
+            support_text=detected.evidence,
+        )
+    mixed_assays = len(detected.kinds) > 1
+    extra_nonrna = any(kind in TYPED_NONRNA for kind in detected.kinds)
+    if any(item in TYPED_NONRNA for item in wanted):
+        if rel == "ok" and detected.confidence == "explicit" and not mixed_assays:
+            return CriterionJudgement(
+                criterion_id=criterion.criterion_id,
+                verdict="pass",
+                reason=f"标题或技术类型明确为 {detected.kind}。",
+                judge_source="rule",
+                support_text=detected.evidence,
+            )
+        if mixed_assays:
+            return CriterionJudgement(
+                criterion_id=criterion.criterion_id,
+                verdict="unknown",
+                reason="研究可能包含多种技术，需核验目标技术的 GSM 子集，不能整体通过或排除。",
+                judge_source="rule",
+                clue_only=True,
+            )
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="unknown",
+            reason="非 RNA 技术证据不足，不能仅凭高通量表达谱标签通过。",
+            judge_source="rule",
+        )
+
+    if "rna_seq_generic" in wanted:
+        return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="unknown",
+            reason="RNA-seq 亚型不限；需样本 library_strategy 证据确认，高通量表达谱标签本身不足。", judge_source="rule")
+
     if "scrna_seq" in wanted:
-        if mixed_tech or (has_scrna and has_snrna):
+        if mixed_tech or (has_scrna and has_snrna) or extra_nonrna:
             return CriterionJudgement(
                 criterion_id=criterion.criterion_id,
                 verdict="unknown",
@@ -227,6 +293,14 @@ def _assay(criterion: Criterion, summary: dict[str, Any], samples: list[dict[str
         return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="unknown", reason="技术类型证据不足。", judge_source="rule")
 
     if "snrna_seq" in wanted:
+        if extra_nonrna or mixed_tech or has_scrna:
+            return CriterionJudgement(
+                criterion_id=criterion.criterion_id,
+                verdict="unknown",
+                reason="研究可能混合多种技术，必须列出同一适用子集的 GSM 才能通过。",
+                judge_source="rule",
+                clue_only=True,
+            )
         if has_snrna and is_rnaseq:
             return CriterionJudgement(
                 criterion_id=criterion.criterion_id,
@@ -238,7 +312,7 @@ def _assay(criterion: Criterion, summary: dict[str, Any], samples: list[dict[str
         return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="unknown", reason="缺少 snRNA-seq 直接描述。", judge_source="rule")
 
     if "bulk_rna_seq" in wanted:
-        if mixed_tech or has_scrna:
+        if mixed_tech or has_scrna or extra_nonrna:
             return CriterionJudgement(
                 criterion_id=criterion.criterion_id,
                 verdict="unknown",
@@ -265,6 +339,86 @@ def _assay(criterion: Criterion, summary: dict[str, Any], samples: list[dict[str
     return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="unknown", reason="未指定可判定技术。", judge_source="rule")
 
 
+def _assay_method(
+    criterion: Criterion,
+    spec: ResearchSpec,
+    summary: dict[str, Any],
+    samples: list[dict[str, Any]],
+) -> CriterionJudgement:
+    wanted = _as_str_list(criterion.value) or list(spec.assay_methods)
+    if not wanted:
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="pass",
+            reason="未指定具体实验方法。",
+            judge_source="rule",
+        )
+    study = infer_study_assay(summary)
+    if samples:
+        ok: list[str] = []
+        contradict: list[str] = []
+        evidence = ""
+        for sample in samples:
+            call = infer_sample_assay(sample, None)
+            rel = sample_method_relation(wanted, sample)
+            gsm = str(sample.get("gsm") or "").upper()
+            if rel == "ok":
+                if gsm:
+                    ok.append(gsm)
+                evidence = evidence or " / ".join(call.methods)
+            elif rel == "contradict" and gsm:
+                contradict.append(gsm)
+        if ok:
+            return CriterionJudgement(
+                criterion_id=criterion.criterion_id,
+                verdict="pass",
+                reason=f"样本子集匹配 {', '.join(wanted)}。",
+                judge_source="rule",
+                support_text=evidence or ", ".join(wanted),
+                qualifying_gsms=ok,
+            )
+        if contradict and len(contradict) == len([s for s in samples if s.get("gsm")]):
+            shown = "、".join(study.methods) or "其他表观组方法"
+            return CriterionJudgement(
+                criterion_id=criterion.criterion_id,
+                verdict="fail",
+                reason=f"已核验样本均为 {shown}，与要求 {', '.join(wanted)} 冲突。",
+                judge_source="rule",
+                support_text=study.evidence or shown,
+            )
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="unknown",
+            reason="混合或证据不足，必须找到匹配具体方法的 GSM 才能通过。",
+            judge_source="rule",
+            clue_only=True,
+        )
+    rel = assay_method_relation(wanted, study.methods)
+    shown = "、".join(study.methods)
+    if rel == "ok":
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="pass",
+            reason=f"标题或摘要明确为 {shown}。",
+            judge_source="rule",
+            support_text=study.evidence or shown,
+        )
+    if rel == "contradict":
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="fail",
+            reason=f"研究明确为 {shown}，不能因为同属表观组学而满足 {', '.join(wanted)}。",
+            judge_source="rule",
+            support_text=study.evidence or shown,
+        )
+    return CriterionJudgement(
+        criterion_id=criterion.criterion_id,
+        verdict="unknown",
+        reason="具体实验方法证据不足，表观组学大类不能代替 ATAC/ChIP/甲基化/Hi-C。",
+        judge_source="rule",
+    )
+
+
 def _keyword(criterion: Criterion, text: str, seeds: list[str], *, hard_fail: bool) -> CriterionJudgement:
     blob = text.lower()
     hit = next((seed for seed in seeds if seed and seed.lower() in blob), None)
@@ -284,6 +438,51 @@ def _keyword(criterion: Criterion, text: str, seeds: list[str], *, hard_fail: bo
         reason="摘要未直接出现该词，需深核或人工核对。",
         judge_source="rule",
     )
+
+
+def _tissue(criterion: Criterion, spec: ResearchSpec, samples: list[dict[str, Any]], text: str) -> CriterionJudgement:
+    matching = [s for s in samples if tissue_matches(s, spec.tissues)]
+    if matching:
+        return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="pass",
+            reason="样本 tissue/source_name 与目标组织匹配。", judge_source="rule",
+            support_text=str(matching[0].get("source_name") or spec.tissues[0]),
+            qualifying_gsms=[str(s.get("gsm") or "") for s in matching if s.get("gsm")])
+    if samples:
+        conflicting = [s for s in samples if sample_tissue_conflicts(s, spec.tissues)]
+        if spec.tissue_required and conflicting:
+            shown = str(conflicting[0].get("source_name") or "")
+            return CriterionJudgement(
+                criterion_id=criterion.criterion_id,
+                verdict="fail",
+                reason="样本取材与要求组织冲突；摘要出现组织词不能视为通过。",
+                judge_source="rule",
+                support_text=shown,
+            )
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="unknown",
+            reason="样本字段未证明目标组织；摘要提及不能视为通过。",
+            judge_source="rule",
+            clue_only=True,
+        )
+    return CriterionJudgement(
+        criterion_id=criterion.criterion_id,
+        verdict="unknown",
+        reason="尚无样本 tissue/source_name；摘要出现组织词不能视为通过。",
+        judge_source="rule",
+        clue_only=True,
+    )
+
+
+def _sample_source(criterion: Criterion, spec: ResearchSpec, samples: list[dict[str, Any]]) -> CriterionJudgement:
+    matching = [s for s in samples if source_kind(s) == spec.sample_source]
+    if matching:
+        return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="pass",
+            reason=f"样本字段支持 {spec.sample_source} 来源。", judge_source="rule",
+            support_text=str(matching[0].get("source_name") or spec.sample_source),
+            qualifying_gsms=[str(s.get("gsm") or "") for s in matching if s.get("gsm")])
+    return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="unknown",
+        reason="样本字段未明确证明所需来源。", judge_source="rule", clue_only=True)
 
 
 def _groups(criterion: Criterion, spec: ResearchSpec, text: str, samples: list[dict[str, Any]]) -> CriterionJudgement:
@@ -329,18 +528,20 @@ def _groups(criterion: Criterion, spec: ResearchSpec, text: str, samples: list[d
 def _clinical(criterion: Criterion, samples: list[dict[str, Any]]) -> CriterionJudgement:
     field = criterion.field.replace("meta_", "")
     keys = AGE_KEYS if field == "age" else SEX_KEYS if field == "sex" else {field, criterion.user_text.lower()}
-    for sample in samples:
-        for row in sample.get("characteristics") or []:
-            key = str(row.get("key") or "").lower()
-            value = str(row.get("value") or "").strip()
-            if key in keys and value:
-                return CriterionJudgement(
-                    criterion_id=criterion.criterion_id,
-                    verdict="pass",
-                    reason=f"样本特征字段 {key} 提供 {field}。",
-                    judge_source="rule",
-                    support_text=str(row.get("raw") or value),
-                )
+    matching = [s for s in samples if _sample_has_keys(s, keys)]
+    if matching:
+        row = next(
+            r for s in matching for r in (s.get("characteristics") or [])
+            if isinstance(r, dict) and str(r.get("key") or "").lower() in keys and str(r.get("value") or "").strip()
+        )
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="pass",
+            reason=f"样本特征字段 {row.get('key')} 提供 {field}。",
+            judge_source="rule",
+            support_text=str(row.get("raw") or row.get("value") or ""),
+            qualifying_gsms=[str(s.get("gsm") or "") for s in matching if s.get("gsm")],
+        )
     return CriterionJudgement(
         criterion_id=criterion.criterion_id,
         verdict="unknown",
@@ -431,11 +632,15 @@ def classify(
             j = by_id.get(c.criterion_id)
             if j is None or j.verdict != "pass" or j.clue_only or not _has_support(j):
                 return "needs_review", "硬条件缺少有效直接证据，或仍为 unknown/线索。"
+        if disease_parse_incomplete(spec):
+            return "needs_review", "疾病条件尚未解析清楚，不能视为满足全部条件。"
         return "recommended", "全部硬条件通过，证据有效，深度核验与复核完成且无未决冲突。"
+    if disease_parse_incomplete(spec):
+        return "needs_review", "疾病条件尚未解析清楚，不能视为满足全部条件。"
     theme = [
         j
         for j in judgements
-        if j.criterion_id in {"disease", "assay", "organism", "tissue"} and j.verdict == "pass" and _has_support(j) and not j.clue_only
+        if j.criterion_id in {"disease", "assay", "assay_method", "organism", "tissue"} and j.verdict == "pass" and _has_support(j) and not j.clue_only
     ]
     if not judgements or all(j.verdict == "unknown" for j in judgements) or not theme:
         return "needs_review", "没有硬条件时仍需主题直接证据；全部 unknown 不能推荐。"
@@ -444,6 +649,18 @@ def classify(
 
 def _has_support(j: CriterionJudgement) -> bool:
     return bool(j.evidence_ids) or bool(j.support_text) or bool(j.quote)
+
+
+def _disease_seeds(spec: ResearchSpec) -> list[str]:
+    seeds: list[str] = []
+    seen: set[str] = set()
+    for seed in spec.disease:
+        for term in [seed, *[item.term for item in lexicon_terms("disease", [seed])]]:
+            key = term.casefold()
+            if term and key not in seen:
+                seen.add(key)
+                seeds.append(term)
+    return seeds
 
 
 def soft_score(spec: ResearchSpec, judgements: list[CriterionJudgement]) -> tuple[float | None, float | None, int]:

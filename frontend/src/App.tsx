@@ -1,8 +1,30 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CircleAlert, Download, Pause, Play, Settings } from "lucide-react";
+import { CircleAlert, Download, Loader2, Pause, Play, Settings, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, ResearchSpec, RunView } from "./api/client";
-import { safeHost } from "./testable";
+import {
+  AuthorCredit,
+  ConnectGate,
+  ConnectionFields,
+  connectionPayload,
+  defaultConn,
+  forgetWorkbench,
+  hadWorkbench,
+  type Conn,
+} from "./Connect";
+import { LanguageSelect, useI18n, type MsgKey } from "./i18n";
+import { nextRunId, runOwnedByProject, totalTokens } from "./testable";
+
+const LIVE_STATUSES = ["queued", "running", "pausing", "waiting_for_credentials"] as const;
+
+function isLive(status?: string) {
+  return !!status && LIVE_STATUSES.includes(status as (typeof LIVE_STATUSES)[number]);
+}
+
+function assayLabels(t: (key: MsgKey) => string, kinds: unknown, fallback?: unknown): string {
+  const list = Array.isArray(kinds) && kinds.length ? kinds.map(String) : [String(fallback || "unknown")];
+  return list.map((kind) => t(`kind_${kind}` as MsgKey)).join(" · ");
+}
 
 const emptySpec: ResearchSpec = {
   original_request: "",
@@ -10,6 +32,7 @@ const emptySpec: ResearchSpec = {
   tissues: [],
   organisms: [],
   assay_types: [],
+  assay_methods: [],
   required_groups: [],
   minimum_donors_per_group: null,
   preferred_metadata: [],
@@ -19,11 +42,15 @@ const emptySpec: ResearchSpec = {
 };
 
 export default function App() {
+  const { t } = useI18n();
   const qc = useQueryClient();
+  const [tier, setTier] = useState<"low" | "medium" | "high" | "ultra">("medium");
+  const [deepLimit, setDeepLimit] = useState("");
+  const presets = useQuery({ queryKey: ["budget-presets"], queryFn: api.budgetPresets });
   const health = useQuery({ queryKey: ["health"], queryFn: api.health });
   const projects = useQuery({ queryKey: ["projects"], queryFn: api.projects });
-  const [request, setRequest] = useState("找人类动脉粥样硬化单细胞数据，要病变和对照，至少每组 3 位供体，最好包含年龄和性别。");
-  const [manualQuery, setManualQuery] = useState('atherosclerosis AND "Homo sapiens"[ORGN] AND "gse"[ETYP]');
+  const [request, setRequest] = useState("");
+  const [manualQuery, setManualQuery] = useState("");
   const [projectId, setProjectId] = useState<string | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
   const [spec, setSpec] = useState<ResearchSpec>(emptySpec);
@@ -31,189 +58,354 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [error, setError] = useState("");
-  const [conn, setConn] = useState({ llm_base_url: "https://api.openai.com/v1", llm_model: "gpt-4o-mini", llm_api_key: "", ncbi_email: "", ncbi_api_key: "" });
+  const [conn, setConn] = useState<Conn>(defaultConn);
+  const [entered, setEntered] = useState(() => hadWorkbench());
+  const session = useQuery({ queryKey: ["connections"], queryFn: api.connections });
+  const keyPresent = Boolean(session.data?.llm_key_present);
+  const ready = entered || keyPresent;
+
+  useEffect(() => {
+    const d = session.data;
+    if (!d?.llm_key_present) return;
+    setConn((c) => ({
+      ...c,
+      llm_base_url: String(d.llm_base_url || c.llm_base_url),
+      llm_model: String(d.llm_model || c.llm_model),
+      ncbi_email: String(d.ncbi_email || c.ncbi_email),
+    }));
+  }, [session.data]);
 
   const runs = useQuery({
     queryKey: ["runs", projectId],
     queryFn: () => api.listRuns(projectId!),
     enabled: !!projectId,
+    refetchInterval: (q) => (q.state.data?.some((r) => isLive(r.status)) ? 1200 : false),
   });
   const run = useQuery({
     queryKey: ["run", runId],
     queryFn: () => api.getRun(runId!),
     enabled: !!runId,
-    refetchInterval: (q) => {
-      const status = q.state.data?.status;
-      return status && ["queued", "running", "pausing", "waiting_for_credentials"].includes(status) ? 1200 : false;
-    },
+    refetchInterval: (q) => (isLive(q.state.data?.status) ? 1200 : false),
   });
+  const liveRun = isLive(run.data?.status);
   const datasets = useQuery({
     queryKey: ["datasets", runId, tab],
     queryFn: () => api.datasets(runId!, tab),
     enabled: !!runId,
-    refetchInterval: 2000,
+    refetchInterval: liveRun ? 2000 : false,
   });
   const queries = useQuery({
     queryKey: ["queries", runId],
     queryFn: () => api.queries(runId!),
     enabled: !!runId,
+    refetchInterval: liveRun ? 1200 : false,
   });
 
   useEffect(() => {
-    if (runs.data && runs.data.length && !runs.data.some((r) => r.id === runId)) {
-      setRunId(runs.data[0].id);
+    if (!projectId) {
+      if (runId) {
+        setRunId(null);
+        setSelected(null);
+      }
+      return;
     }
-  }, [runs.data, runId]);
+    if (runs.isFetching && !runs.data) return;
+    const next = nextRunId(runs.data, runId);
+    if (next !== runId) {
+      setRunId(next);
+      setSelected(null);
+    }
+  }, [projectId, runs.data, runs.isFetching, runId]);
   const detail = useQuery({
     queryKey: ["detail", runId, selected],
     queryFn: () => api.dataset(runId!, selected!),
     enabled: !!runId && !!selected,
   });
 
+  useEffect(() => {
+    if (runId && run.data?.status && !isLive(run.data.status)) {
+      qc.invalidateQueries({ queryKey: ["datasets", runId] });
+      qc.invalidateQueries({ queryKey: ["queries", runId] });
+      qc.invalidateQueries({ queryKey: ["detail", runId] });
+    }
+  }, [runId, run.data?.status, qc]);
+
   const createProject = useMutation({
     mutationFn: () => api.createProject(request),
     onSuccess: (p) => {
       setProjectId(p.id);
       setSpec(p.spec);
+      setRunId(null);
+      setSelected(null);
       qc.invalidateQueries({ queryKey: ["projects"] });
     },
     onError: (e: Error) => setError(e.message),
   });
   const parseSpec = useMutation({
     mutationFn: () => api.parseSpec(projectId!),
-    onSuccess: (r) => setSpec(r.spec),
+    onSuccess: (r) => { setSpec(r.spec); qc.invalidateQueries({ queryKey: ["projects"] }); },
     onError: (e: Error) => setError(e.message),
   });
   const startRun = useMutation({
-    mutationFn: (body: Record<string, unknown>) => api.createRun(projectId!, body),
+    mutationFn: async (body: Record<string, unknown>) => {
+      await api.saveSpec(projectId!, spec);
+      return api.createRun(projectId!, body);
+    },
     onSuccess: (r) => {
       setRunId(r.id);
+      qc.setQueryData(["run", r.id], r);
       setError("");
+      qc.invalidateQueries({ queryKey: ["runs", projectId] });
+      qc.invalidateQueries({ queryKey: ["queries"] });
+      qc.invalidateQueries({ queryKey: ["datasets"] });
     },
     onError: (e: Error) => setError(e.message),
   });
 
-  const current: RunView | undefined = run.data;
+  const current: RunView | undefined = run.data && runOwnedByProject(run.data, projectId) ? run.data : undefined;
+  const parseUsage = projects.data?.find(p => p.id === projectId)?.parse_token_usage;
+  const starting = startRun.isPending;
+  const active = starting || isLive(current?.status);
   const demo = health.data?.demo;
+
+  if (session.isPending && !entered) {
+    return (
+      <div className="gate">
+        <div className="gate-card">
+          <h1>GEOScout</h1>
+          <p className="muted">{t("checking")}</p>
+          <AuthorCredit />
+        </div>
+      </div>
+    );
+  }
+
+  if (!ready) {
+    return (
+      <ConnectGate
+        conn={conn}
+        onChange={setConn}
+        version={health.data?.version || "0.1.1"}
+        onReady={() => {
+          setEntered(true);
+          qc.invalidateQueries({ queryKey: ["connections"] });
+        }}
+      />
+    );
+  }
 
   return (
     <div className="app">
       <aside className="sidebar">
         <h1>GEOScout</h1>
-        <p className="muted">本地 GEO 发现与核验。不承诺穷尽全部 GEO。</p>
+        <p className="muted">
+          {t("workbenchTagline")} v{health.data?.version || "0.1.1"}
+        </p>
+        <AuthorCredit />
         <div className="row" style={{ margin: "12px 0" }}>
-          <button className="secondary" onClick={() => setSettingsOpen((v) => !v)} aria-label="打开设置">
-            <Settings size={16} /> 设置
+          <button className="secondary" onClick={() => setSettingsOpen((v) => !v)} aria-label={t("settings")}>
+            <Settings size={16} /> {t("settingsBtn")}
           </button>
+          <LanguageSelect />
         </div>
         {settingsOpen && (
           <div className="card stack">
-            <label>模型 Base URL
-              <input value={conn.llm_base_url} onChange={(e) => setConn({ ...conn, llm_base_url: e.target.value })} />
-            </label>
-            <p className="muted">请求将发往：{safeHost(conn.llm_base_url)}</p>
-            <label>模型名<input value={conn.llm_model} onChange={(e) => setConn({ ...conn, llm_model: e.target.value })} /></label>
-            <label>模型 API Key
-              <input type="password" autoComplete="off" value={conn.llm_api_key} onChange={(e) => setConn({ ...conn, llm_api_key: e.target.value })} />
-            </label>
-            <label>NCBI 联系邮箱<input value={conn.ncbi_email} onChange={(e) => setConn({ ...conn, ncbi_email: e.target.value })} /></label>
-            <label>NCBI API Key（可选）
-              <input type="password" value={conn.ncbi_api_key} onChange={(e) => setConn({ ...conn, ncbi_api_key: e.target.value })} />
-            </label>
+            <ConnectionFields conn={conn} onChange={setConn} />
             <button
               onClick={async () => {
                 try {
-                  await api.saveConnections(conn);
-                  const r = await api.testConnections(conn);
-                  setError(r && (r as { message?: string }).message ? String((r as { message?: string }).message) : "已测试");
+                  const body = connectionPayload(conn);
+                  await api.saveConnections(body);
+                  const r = await api.testConnections(body);
+                  setConn({ ...conn, llm_api_key: "", ncbi_api_key: "" });
+                  setError(r && (r as { message?: string }).message ? String((r as { message?: string }).message) : t("testConn"));
+                  qc.invalidateQueries({ queryKey: ["connections"] });
                 } catch (e) {
                   setError((e as Error).message);
                 }
               }}
             >
-              测试连接
+              {t("testConn")}
             </button>
           </div>
         )}
-        <h3>任务</h3>
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <h3>{t("tasks")}</h3>
+          <button
+            className="secondary"
+            disabled={!projects.data?.length}
+            onClick={async () => {
+              if (!window.confirm(t("clearConfirm"))) return;
+              try {
+                await api.clearWorkspace();
+                setProjectId(null);
+                setRunId(null);
+                setSelected(null);
+                setSpec(emptySpec);
+                setRequest("");
+                setError(t("cleared"));
+                qc.invalidateQueries({ queryKey: ["projects"] });
+                qc.invalidateQueries({ queryKey: ["runs"] });
+              } catch (e) {
+                setError((e as Error).message);
+              }
+            }}
+          >
+            <Trash2 size={14} /> {t("clearTasks")}
+          </button>
+        </div>
         {(projects.data || []).map((p) => (
-          <button key={p.id} className={`task ${p.id === projectId ? "active" : ""}`} onClick={() => { setProjectId(p.id); setSpec(p.spec); }}>
+          <button key={p.id} className={`task ${p.id === projectId ? "active" : ""}`} onClick={() => { setProjectId(p.id); setSpec(p.spec); setRequest(p.original_request || ""); setRunId(null); setSelected(null); }}>
             {p.name}
           </button>
         ))}
         {(runs.data || []).map((r) => (
-          <button key={r.id} className={`task ${r.id === runId ? "active" : ""}`} onClick={() => setRunId(r.id)}>
-            {r.status} · {r.mode}
+          <button
+            key={r.id}
+            className={`task ${r.id === runId ? "active" : ""} ${isLive(r.status) ? "live" : ""}`}
+            onClick={() => setRunId(r.id)}
+          >
+            {statusLabel(r.status, t)} · {r.mode}
           </button>
         ))}
       </aside>
       <main className="main">
-        {demo && <div className="banner demo">当前为显式演示模式。真实检索失败时不会改用这些数据。</div>}
+        {demo && <div className="banner demo">{t("demoBanner")}</div>}
         {health.data && (
           <div className="banner">
-            NCBI：{health.data.ncbi_mode}　模型：{health.data.llm_mode}　本机监听 127.0.0.1
+            {t("banner", { ncbi: health.data.ncbi_mode, llm: health.data.llm_mode })}
           </div>
         )}
         {error && <div className="error" role="alert">{error}</div>}
-        <section className="stack">
-          <h2>课题</h2>
-          <textarea value={request} onChange={(e) => setRequest(e.target.value)} aria-label="课题描述" />
-          <div className="row">
-            <button onClick={() => createProject.mutate()}>创建课题</button>
-            <button className="secondary" disabled={!projectId} onClick={() => parseSpec.mutate()}>解析条件</button>
+        {(starting || current) && (
+          <div
+            className={`banner run-status ${active ? "live" : ""}`}
+            role="status"
+            aria-live="polite"
+            aria-busy={active}
+          >
+            {active && <span className="dot" aria-hidden="true" />}
+            <span>
+              {starting ? t("starting") : statusLabel(current!.status, t)}
+              {!starting && current ? ` · ${t("stage")} ${current.stage}` : ""}
+            </span>
+            {current && !starting && (
+              <span className="muted" style={{ fontWeight: 500 }}>
+                {t("queries")} {current.counters.queries_done || 0}
+                {" · "}
+                {t("uniqueGse")} {current.counters.unique_gse || 0}
+              </span>
+            )}
           </div>
+        )}
+        <section className="stack">
+          <h2>{t("topic")}</h2>
+          <textarea
+            value={request}
+            onChange={(e) => setRequest(e.target.value)}
+            aria-label={t("topic")}
+            placeholder={t("topicPh")}
+          />
+          <div className="row">
+            <button disabled={!request.trim()} onClick={() => createProject.mutate()}>{t("createTopic")}</button>
+            <button className="secondary" disabled={!projectId || parseSpec.isPending} onClick={() => parseSpec.mutate()}>{t("parseSpec")}</button>
+          </div>
+          {!!totalTokens(parseUsage) && <p className="muted">{t("parseUsage")} {totalTokens(parseUsage)}{parseUsage?.estimated && ` (${t("estimatedUsage")})`}</p>}
           <SpecEditor spec={spec} onChange={setSpec} />
           <div className="row">
             <button
-              disabled={!projectId}
-              onClick={() => startRun.mutate({ mode: "full", one_click: false })}
+              disabled={!projectId || active || (deepLimit !== "" && (!Number.isInteger(Number(deepLimit)) || Number(deepLimit) < 0 || Number(deepLimit) > (presets.data?.[tier]?.max_unique_gse ?? 0)))}
+              onClick={() => startRun.mutate({ mode: "full", tier, ...(deepLimit !== "" ? { deep_limit: Number(deepLimit) } : {}) })}
             >
-              确认条件后运行
+              {active ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
+              {starting ? t("starting") : isLive(current?.status) ? statusLabel(current!.status, t) : t("startRun")}
             </button>
-            <button
-              className="secondary"
-              disabled={!projectId}
-              onClick={() => startRun.mutate({ mode: "full", one_click: true, budget: { max_unique_gse: 80, max_deep_verify: 20, max_queries: 12 } })}
-            >
-              一键运行（默认预算）
-            </button>
+            <label>{t("intensity")}
+              <select value={tier} onChange={(e) => { setTier(e.target.value as typeof tier); setDeepLimit(""); }}>
+                {(["low", "medium", "high", "ultra"] as const).map((value) => <option key={value} value={value}>{t(value)}</option>)}
+              </select>
+            </label>
           </div>
-          <h3>手工英文检索（无需模型 Key）</h3>
-          <input value={manualQuery} onChange={(e) => setManualQuery(e.target.value)} aria-label="手工 GEO 检索式" />
+          {presets.data?.[tier] && <p className="muted">
+            GSE ≤ {presets.data[tier].max_unique_gse} · SOFT ≤ {presets.data[tier].max_deep_verify}
+            {` · ${t("tokenBudget")} `}{presets.data[tier].max_tokens} · {presets.data[tier].max_runtime_s / 60} min
+          </p>}
+          <label>{t("deepLimit")}<input type="number" min="0" max={presets.data?.[tier]?.max_unique_gse} step="1" value={deepLimit} placeholder={`${t("tierDefault")} (${presets.data?.[tier]?.max_deep_verify ?? ""})`} onChange={(e) => setDeepLimit(e.target.value)} /></label>
+          {deepLimit !== "" && Number(deepLimit) > (presets.data?.[tier]?.max_deep_verify ?? 0) && <p className="muted">{t("deepLimitHint")}</p>}
+          <h3>{t("manualSearch")}</h3>
+          <input
+            value={manualQuery}
+            onChange={(e) => setManualQuery(e.target.value)}
+            aria-label={t("manualSearch")}
+            placeholder="GSE1000[Accession]"
+          />
           <button
             className="secondary"
-            disabled={!projectId}
+            disabled={!projectId || !manualQuery.trim() || active}
             onClick={() => startRun.mutate({ mode: "manual_query", manual_query: manualQuery, budget: { max_unique_gse: 40 } })}
           >
-            真实/当前 NCBI 模式检索
+            {starting ? <Loader2 className="spin" size={14} /> : null}
+            {starting ? t("starting") : t("ncbiSearch")}
           </button>
         </section>
         {current && (
           <section>
-            <h2>运行</h2>
+            <h2>{t("run")}</h2>
             <p>
-              阶段 {current.stage}　状态 {statusLabel(current.status)}　查询 {current.counters.queries_done || 0}　唯一 GSE {current.counters.unique_gse || 0}
-              {current.token_usage?.prompt_tokens != null && `　token ${String(current.token_usage.prompt_tokens)}`}
+              {t("stage")} {current.stage}　{t("status")} {statusLabel(current.status, t)}　{t("queries")} {current.counters.queries_done || 0}　{t("uniqueGse")} {current.counters.unique_gse || 0}
+              {current.token_usage?.prompt_tokens != null && `　token ${totalTokens(current.token_usage)}${current.token_usage.estimated ? ` (${t("estimatedUsage")})` : ""}`}
             </p>
-            {current.stop_reason && <p className="muted">停止原因：{current.stop_reason}</p>}
-            {current.status === "waiting_for_credentials" && <p><CircleAlert size={14} /> 凭据丢失，请在设置中重新填写 Key 后恢复。</p>}
+            {current.stop_reason && <p className="muted">{t("stopReason")}{current.stop_reason}</p>}
+            {current.budget && (
+              <p className="muted">
+                GSE ≤ {current.budget.max_unique_gse ?? "?"}
+                {" · SOFT ≤ "}
+                {current.budget.max_deep_verify ?? "?"}
+                {` · ${t("tokenBudget")} `}
+                {current.budget.max_tokens ?? "?"}
+              </p>
+            )}
+            {current.status === "waiting_for_credentials" && (
+              <p>
+                <CircleAlert size={14} /> {t("credsLost")}
+                <button
+                  className="secondary"
+                  style={{ marginLeft: 8 }}
+                  onClick={() => {
+                    forgetWorkbench();
+                    setEntered(false);
+                    setSettingsOpen(true);
+                  }}
+                >
+                  {t("reenterKey")}
+                </button>
+              </p>
+            )}
             <div className="row">
-              <button className="secondary" onClick={() => api.pause(current.id)}><Pause size={14} /> 暂停</button>
-              <button className="secondary" onClick={() => api.resume(current.id)}><Play size={14} /> 恢复</button>
-              <button className="bad" onClick={() => api.cancel(current.id)}>取消</button>
+              <button className="secondary" onClick={() => api.pause(current.id)}><Pause size={14} /> {t("pause")}</button>
+              <button className="secondary" onClick={() => api.resume(current.id)}><Play size={14} /> {t("resume")}</button>
+              <button className="bad" onClick={async () => {
+                setError("");
+                try {
+                  await api.cancel(current.id);
+                  await qc.invalidateQueries({ queryKey: ["run", current.id] });
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : String(e));
+                }
+              }}>{t("cancel")}</button>
               <button
                 onClick={async () => {
                   const exp = await api.exportRun(current.id);
                   window.location.href = exp.download;
                 }}
               >
-                <Download size={14} /> 导出 Excel
+                <Download size={14} /> {t("exportExcel")}
               </button>
             </div>
-            <h3>查询日志</h3>
+            <h3>{t("queryLog")}</h3>
             <div className="table-wrap">
               <table>
-                <thead><tr><th>轮次</th><th>检索式</th><th>命中</th><th>新增</th><th>状态</th></tr></thead>
+                <thead><tr><th>{t("round")}</th><th>{t("term")}</th><th>{t("hits")}</th><th>{t("added")}</th><th>{t("status")}</th></tr></thead>
                 <tbody>
                   {(queries.data || []).map((q, i) => (
                     <tr key={i}><td>{q.round_no}</td><td>{q.term}</td><td>{q.hit_count ?? ""}</td><td>{q.new_unique_gse}</td><td>{q.status}</td></tr>
@@ -224,7 +416,7 @@ export default function App() {
             <div className="tabs" role="tablist">
               {(["recommended", "needs_review", "excluded"] as const).map((id) => (
                 <button key={id} role="tab" aria-selected={tab === id} className="secondary" onClick={() => setTab(id)}>
-                  {id === "recommended" ? "推荐" : id === "needs_review" ? "待核实" : "排除"}
+                  {id === "recommended" ? t("recommended") : id === "needs_review" ? t("needsReview") : t("excluded")}
                 </button>
               ))}
             </div>
@@ -232,7 +424,7 @@ export default function App() {
               <table>
                 <thead>
                   <tr>
-                    <th>GSE</th><th>标题</th><th>物种</th><th>技术</th><th>状态</th><th>理由</th>
+                    <th>GSE</th><th>{t("title")}</th><th>{t("taxon")}</th><th>{t("tech")}</th><th>{t("status")}</th><th>{t("reason")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -241,14 +433,17 @@ export default function App() {
                       <td>{String(row.gse)}</td>
                       <td>{String(row.title || "")}</td>
                       <td>{String(row.taxon || "")}</td>
-                      <td>{String(row.gdstype || "")}</td>
+                      <td>
+                        {assayLabels(t, row.assay_kinds, row.assay_kind)}
+                        {row.gdstype ? <div className="muted">{String(row.gdstype)}</div> : null}
+                      </td>
                       <td><span className={`pill ${String(row.category)}`}>{statusIcon(String(row.category))} {String(row.category)}</span></td>
                       <td>{String(row.reason || "")}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-              {(datasets.data?.items || []).length === 0 && <p className="muted">无候选</p>}
+              {(datasets.data?.items || []).length === 0 && <p className="muted">{t("noCandidates")}</p>}
             </div>
             {detail.data && <Detail data={detail.data} runId={current.id} onOverride={() => qc.invalidateQueries({ queryKey: ["datasets", runId] })} />}
           </section>
@@ -259,73 +454,89 @@ export default function App() {
 }
 
 function SpecEditor({ spec, onChange }: { spec: ResearchSpec; onChange: (s: ResearchSpec) => void }) {
+  const { t } = useI18n();
   const join = (xs: string[]) => xs.join(", ");
   const split = (s: string) => s.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
   return (
     <div className="criteria">
-      <label>疾病<input value={join(spec.disease)} onChange={(e) => onChange({ ...spec, disease: split(e.target.value) })} /></label>
-      <label>组织<input value={join(spec.tissues)} onChange={(e) => onChange({ ...spec, tissues: split(e.target.value) })} /></label>
-      <label>物种
+      <label>{t("disease")}<input value={join(spec.disease)} onChange={(e) => onChange({ ...spec, disease: split(e.target.value) })} /></label>
+      <label>{t("tissue")}<input value={join(spec.tissues)} onChange={(e) => onChange({ ...spec, tissues: split(e.target.value) })} /></label>
+      <label><input type="checkbox" checked={!!spec.tissue_required} onChange={(e) => onChange({ ...spec, tissue_required: e.target.checked })} />{t("tissueRequired")}</label>
+      <label>{t("sampleSource")}<select value={spec.sample_source ?? "any"} onChange={(e) => onChange({ ...spec, sample_source: e.target.value })}>
+        <option value="any">{t("unspecified")}</option><option value="primary">{t("sourcePrimary")}</option><option value="cell_line">{t("sourceCell")}</option><option value="organoid">{t("sourceOrganoid")}</option><option value="xenograft">{t("sourceXeno")}</option>
+      </select></label>
+      <label>{t("organism")}
         <select value={spec.organisms[0] || ""} onChange={(e) => onChange({ ...spec, organisms: e.target.value ? [e.target.value] : [] })}>
-          <option value="">未指定</option>
+          <option value="">{t("unspecified")}</option>
           <option value="Homo sapiens">Homo sapiens</option>
           <option value="Mus musculus">Mus musculus</option>
         </select>
       </label>
-      <label>技术
+      <label>{t("assay")}
         <select value={spec.assay_types[0] || ""} onChange={(e) => onChange({ ...spec, assay_types: e.target.value ? [e.target.value] : [] })}>
-          <option value="">未指定</option>
-          <option value="scrna_seq">scRNA-seq</option>
-          <option value="snrna_seq">snRNA-seq</option>
-          <option value="bulk_rna_seq">bulk RNA-seq</option>
+          <option value="">{t("unspecified")}</option>
+          <option value="scrna_seq">{t("kind_scrna_seq")}</option>
+          <option value="snrna_seq">{t("kind_snrna_seq")}</option>
+          <option value="bulk_rna_seq">{t("kind_bulk_rna_seq")}</option>
+          <option value="rna_seq_generic">{t("kind_rna_seq_generic")}</option>
+          <option value="spatial_transcriptomics">{t("kind_spatial_transcriptomics")}</option>
+          <option value="proteomics">{t("kind_proteomics")}</option>
+          <option value="epigenomics">{t("kind_epigenomics")}</option>
+          <option value="microbiome">{t("kind_microbiome")}</option>
         </select>
       </label>
-      <label>每组最少供体<input type="number" value={spec.minimum_donors_per_group ?? ""} onChange={(e) => onChange({ ...spec, minimum_donors_per_group: e.target.value ? Number(e.target.value) : null })} /></label>
-      <label>处理后矩阵
+      <label>{t("assayMethods")}<input value={join(spec.assay_methods || [])} onChange={(e) => onChange({ ...spec, assay_methods: split(e.target.value) })} /></label>
+      <label>{t("minDonors")}<input type="number" value={spec.minimum_donors_per_group ?? ""} onChange={(e) => onChange({ ...spec, minimum_donors_per_group: e.target.value ? Number(e.target.value) : null })} /></label>
+      <label>{t("matrix")}
         <select value={spec.processed_matrix_requirement} onChange={(e) => onChange({ ...spec, processed_matrix_requirement: e.target.value })}>
-          <option value="none">无要求</option>
-          <option value="preferred">最好有</option>
-          <option value="required">必须</option>
+          <option value="none">{t("matrixNone")}</option>
+          <option value="preferred">{t("matrixPref")}</option>
+          <option value="required">{t("matrixReq")}</option>
         </select>
       </label>
       {spec.unresolved_questions.length > 0 && (
-        <div className="card">未决：{spec.unresolved_questions.join("；")}</div>
+        <div className="card">{t("unresolved")}{spec.unresolved_questions.join("；")}</div>
       )}
     </div>
   );
 }
 
 function Detail({ data, runId, onOverride }: { data: Record<string, unknown>; runId: string; onOverride: () => void }) {
-  const ds = data.dataset as Record<string, string>;
+  const { t } = useI18n();
+  const ds = (data.dataset ?? {}) as Record<string, unknown>;
   const rd = data.run_dataset as Record<string, unknown>;
+  const selection = (rd?.selection ?? {}) as { selected?: boolean; rank?: number; reasons?: string[] };
   const samples = (data.samples as Record<string, unknown>[]) || [];
   const assessments = (data.assessments as Record<string, unknown>[]) || [];
   const finals = assessments.filter((a) => a.stage === "final");
   const shown = finals.length ? finals : assessments;
-  const [reason, setReason] = useState("人工核验后覆盖");
+  const [reason, setReason] = useState(() => t("defaultOverride"));
   return (
     <div className="detail">
-      <h3>{String(data.gse)} 详情</h3>
-      <p><a href={String(data.url)} target="_blank" rel="noreferrer">GEO 官方页面</a></p>
-      <p>{ds?.title}</p>
-      <p className="muted">{ds?.summary}</p>
-      <p>GSM {String(rd?.gsm_count ?? "")}　独立供体 {rd?.independent_donors == null ? "未知" : String(rd.independent_donors)}</p>
-      <h4>逐条件判断（最终）</h4>
+      <h3>{String(data.gse)} {t("detail")}</h3>
+      <p><a href={String(data.url)} target="_blank" rel="noreferrer">{t("geoPage")}</a></p>
+      <p>{String(ds.title ?? "")}</p>
+      <p>{assayLabels(t, ds.assay_kinds, ds.assay_kind)}{ds.gdstype ? ` · ${String(ds.gdstype)}` : ""}</p>
+      {selection.selected !== undefined && <p>{selection.selected ? `${t("selectionRank")}: ${selection.rank}` : t("notSelected")}</p>}
+      {!!selection.reasons?.length && <p>{t("selectionReason")}: {selection.reasons.map((reason) => t(reason as MsgKey)).join(", ")}</p>}
+      <p className="muted">{String(ds.summary ?? "")}</p>
+      <p>{t("gsmCount")} {String(rd?.gsm_count ?? "")}　{t("independentDonors")} {rd?.independent_donors == null ? t("unknown") : String(rd.independent_donors)}</p>
+      <h4>{t("judgements")}</h4>
       <ul>
         {shown.map((a, i) => (
           <li key={i}>
             {String(a.criterion_id)} · {String(a.stage)} · {String(a.verdict)} — {String(a.reason)}
             {Array.isArray(a.evidence_ids) && a.evidence_ids.length > 0 ? (
-              <span className="muted"> 证据 {(a.evidence_ids as unknown[]).map(String).join(", ")}</span>
+              <span className="muted"> {t("evidence")} {(a.evidence_ids as unknown[]).map(String).join(", ")}</span>
             ) : null}
-            {a.quote ? <div className="muted">引文：{String(a.quote)}</div> : null}
+            {a.quote ? <div className="muted">{t("quote")}{String(a.quote)}</div> : null}
           </li>
         ))}
       </ul>
-      <h4>样本（{samples.length}）</h4>
+      <h4>{t("samples")}（{samples.length}）</h4>
       <div className="table-wrap">
         <table>
-          <thead><tr><th>GSM</th><th>标题</th><th>物种</th><th>供体</th></tr></thead>
+          <thead><tr><th>GSM</th><th>{t("title")}</th><th>{t("organism")}</th><th>{t("donor")}</th></tr></thead>
           <tbody>
             {samples.slice(0, 50).map((s) => (
               <tr key={String(s.gsm)}><td>{String(s.gsm)}</td><td>{String(s.title)}</td><td>{String(s.organism)}</td><td>{String(s.donor_key || "")}</td></tr>
@@ -334,20 +545,18 @@ function Detail({ data, runId, onOverride }: { data: Record<string, unknown>; ru
         </table>
       </div>
       <div className="row">
-        <input value={reason} onChange={(e) => setReason(e.target.value)} aria-label="覆盖理由" />
-        <button className="secondary" onClick={async () => { await api.override(runId, String(data.gse), "recommended", reason); onOverride(); }}>标为推荐</button>
-        <button className="secondary" onClick={async () => { await api.override(runId, String(data.gse), "excluded", reason); onOverride(); }}>标为排除</button>
+        <input value={reason} onChange={(e) => setReason(e.target.value)} aria-label={t("overrideReason")} />
+        <button className="secondary" onClick={async () => { await api.override(runId, String(data.gse), "recommended", reason); onOverride(); }}>{t("markRecommended")}</button>
+        <button className="secondary" onClick={async () => { await api.override(runId, String(data.gse), "excluded", reason); onOverride(); }}>{t("markExcluded")}</button>
       </div>
     </div>
   );
 }
 
-function statusLabel(s: string) {
-  const map: Record<string, string> = {
-    queued: "排队", running: "运行中", pausing: "正在暂停", paused: "已暂停",
-    waiting_for_credentials: "等待凭据", completed: "完成", partial: "部分完成", failed: "失败", cancelled: "已取消",
-  };
-  return map[s] || s;
+function statusLabel(s: string, t: (key: MsgKey) => string) {
+  const known: MsgKey[] = ["starting", "queued", "running", "pausing", "paused", "waiting_for_credentials", "completed", "partial", "failed", "cancelled"];
+  if (known.includes(s as MsgKey)) return t(s as MsgKey);
+  return s;
 }
 function statusIcon(cat: string) {
   if (cat === "recommended") return "●";

@@ -7,12 +7,15 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 5173,
     proxy: {
-      "/api": "http://127.0.0.1:8000",
+      "/api": process.env.GEOSCOUT_API_URL || "http://127.0.0.1:8000",
     },
   },
   preview: {
     host: "127.0.0.1",
     port: 5173,
+    proxy: {
+      "/api": process.env.GEOSCOUT_API_URL || "http://127.0.0.1:8000",
+    },
   },
   test: {
     environment: "node",

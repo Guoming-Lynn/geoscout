@@ -1,4 +1,4 @@
-首次核验。只阅读本消息中的 spec、summary、samples[] 与 evidence，不要假设已有结论。
+首次核验。只阅读本消息中的 spec、summary、samples[] 与 evidence，不要假设已有结论。先确认输入完整性，再逐条判断硬条件，最后判断软条件；硬条件 unknown、冲突或证据覆盖不完整时，绝不能给出可推荐结论。
 对每个 inclusion_criteria 给出 pass/fail/unknown。
 GEO 未提及年龄或性别不能判 fail。
 若同一 GSE 含多种物种/组织/技术，不得把不同子集拼接成一个虚构合格队列。

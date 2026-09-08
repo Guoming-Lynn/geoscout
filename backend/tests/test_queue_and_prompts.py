@@ -21,9 +21,24 @@ def test_assess_and_verify_share_json_contract():
     assert "verdict 字段名必须是 verdict" in verify
     assert "来源冲突" in assess
     assert "来源冲突" in verify
+    assert "你是 GEOScout 的证据审查器" in assess
+    assert "你是 GEOScout 的证据审查器" in verify
     assert "首次核验" in assess
     assert "独立复核" in verify
     assert "不要读取或假设首次核验结论" in verify
+
+
+def test_parse_and_expand_do_not_use_reviewer_prompt():
+    parse = load_prompt("parse_research_spec")
+    expand = load_prompt("expand_queries")
+    assert "不可信外部数据" in parse
+    assert "不可信外部数据" in expand
+    assert "你是 GEOScout 的证据审查器" not in parse
+    assert "你是 GEOScout 的证据审查器" not in expand
+    assert "来源冲突" not in parse
+    assert "来源冲突" not in expand
+    assert "verdict 字段名必须是 verdict" not in parse
+    assert "verdict 字段名必须是 verdict" not in expand
 
 
 @pytest.mark.asyncio
@@ -156,7 +171,7 @@ async def test_assessment_format_repair_runs_once(monkeypatch):
 
     llm = FakeLLM()
     engine._llm = lambda _run: llm
-    engine._guard = lambda _run, _next: None
+    engine._guard = lambda _run, _next, **_kw: None
     checked = await engine._complete_assessment(
         run,
         prompt_name="assess_dataset",

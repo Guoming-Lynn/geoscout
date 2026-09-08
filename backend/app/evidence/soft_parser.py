@@ -163,12 +163,34 @@ def sample_as_dict(sample: SoftEntity) -> dict[str, Any]:
         "instrument_model": sample.first("instrument_model"),
         "molecule": sample.first("molecule_ch1"),
         "description": " ".join(sample.get("description")),
+        "protocol": _protocol_text(sample),
+        "protocol_fields": _protocol_fields(sample),
         "characteristics": characteristics_map(sample),
         "relations": sample.get("relation"),
         "supplementary_file": sample.get("supplementary_file"),
         "donor_key": donor_key_from_sample(sample),
         "geo_accession": sample.first("geo_accession") or sample.accession,
     }
+
+
+def _protocol_kind(key: str) -> str:
+    return re.sub(r"_ch\d+$", "", key.casefold())
+
+
+def _protocol_fields(sample: SoftEntity) -> dict[str, str]:
+    grouped: dict[str, list[str]] = {}
+    for key, values in sample.fields.items():
+        if "protocol" not in key.casefold():
+            continue
+        bits = [part.strip() for part in values if part and part.strip()]
+        if not bits:
+            continue
+        grouped.setdefault(_protocol_kind(key), []).extend(bits)
+    return {kind: " ".join(parts) for kind, parts in grouped.items()}
+
+
+def _protocol_text(sample: SoftEntity) -> str:
+    return " ".join(text for text in _protocol_fields(sample).values() if text)
 
 
 def series_as_dict(doc: SoftDocument) -> dict[str, Any]:

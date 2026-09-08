@@ -39,8 +39,11 @@ async def init_db() -> None:
 def _migrate_sqlite_columns(sync_conn) -> None:  # type: ignore[no-untyped-def]
     """Add columns introduced after v0.1 so existing user SQLite files keep data."""
     needed = {
+        "projects": [("parse_usage_json", "ALTER TABLE projects ADD COLUMN parse_usage_json TEXT DEFAULT '{}' NOT NULL")],
         "query_attempts": [
             ("truncated", "ALTER TABLE query_attempts ADD COLUMN truncated BOOLEAN DEFAULT 0 NOT NULL"),
+            ("query_index", "ALTER TABLE query_attempts ADD COLUMN query_index INTEGER DEFAULT 0 NOT NULL"),
+            ("candidate_limit", "ALTER TABLE query_attempts ADD COLUMN candidate_limit INTEGER DEFAULT 0 NOT NULL"),
         ],
         "assessments": [
             ("judge_source", "ALTER TABLE assessments ADD COLUMN judge_source VARCHAR(40) DEFAULT ''"),
@@ -65,6 +68,18 @@ def _migrate_sqlite_columns(sync_conn) -> None:  # type: ignore[no-untyped-def]
         for name, ddl in cols:
             if name not in existing:
                 sync_conn.execute(text(ddl))
+                if table == "query_attempts" and name == "query_index":
+                    sync_conn.execute(text("""
+                        WITH ordered AS (
+                            SELECT id, ROW_NUMBER() OVER (
+                                PARTITION BY run_id ORDER BY round_no,
+                                CASE WHEN source = 'user' THEN 0 ELSE 1 END, rowid
+                            ) - 1 AS position FROM query_attempts
+                        )
+                        UPDATE query_attempts SET query_index = (
+                            SELECT position FROM ordered WHERE ordered.id = query_attempts.id
+                        )
+                    """))
     _collapse_duplicate_samples(sync_conn)
     _backfill_run_evidence(sync_conn)
 

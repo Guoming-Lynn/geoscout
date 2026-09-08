@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.schemas.spec import CriterionJudgement, ResearchSpec
+from app.pipeline.lexicon import lexicon_terms
 
 LESION_TOKENS = {
     "lesion",
@@ -27,6 +28,12 @@ GROUP_KEYS = {
     "disease",
     "disease status",
     "disease_status",
+    "disease state",
+    "subject status",
+    "disease_state",
+    "subject_status",
+    "clinical status",
+    "type",
     "status",
     "treatment",
     "phenotype",
@@ -38,6 +45,14 @@ GROUP_KEYS = {
 LESION_GROUP_NAMES = {"lesion", "tumor", "tumour", "case", "disease"}
 CONTROL_GROUP_NAMES = {"control", "healthy", "normal", "adjacent", "wt", "untreated"}
 TREATMENT_GROUP_NAMES = {"treated", "untreated"}
+
+# Short labels are interpreted only in the context of the requested disease.
+DISEASE_LABELS = {
+    "alzheimer disease": ["AD", "sAD", "LOAD", "EOAD", "SAD", "MAD"],
+    "type 2 diabetes": ["T2D", "T2DM"],
+    "rheumatoid arthritis": ["RA", "Rheumatiod arthritis", "rhematoid arthritis"],
+    "COVID-19": ["COVID", "COVID19", "SARS-CoV-2"],
+}
 
 _NEGATED_DISEASE = re.compile(
     r"\b(?:no|without|free of)\s+(?:disease|diseased|lesion|pathology)\b"
@@ -71,34 +86,53 @@ def infer_group_label(
     if spec is not None:
         required_groups = required_groups or spec.required_groups
         control_type = control_type or spec.control_type
-    traits = parse_sample_traits(sample)
+    traits = parse_sample_traits(sample, spec=spec)
     return map_traits_to_group(traits, required_groups or ["lesion", "control"], control_type)
 
 
-def parse_sample_traits(sample: dict[str, Any]) -> SampleTraits:
+def parse_sample_traits(sample: dict[str, Any], *, spec: ResearchSpec | None = None) -> SampleTraits:
     acc = SampleTraits()
-    texts: list[str] = []
-    if sample.get("group_label"):
-        texts.append(str(sample["group_label"]))
+    texts: list[tuple[str, str]] = []
+    if sample.get("group_label") and spec is None:
+        texts.append(("group", str(sample["group_label"])))
     for row in sample.get("characteristics") or []:
         key = str(row.get("key") or "")
         value = str(row.get("value") or "")
         raw = str(row.get("raw") or f"{key}: {value}")
         if value:
-            texts.append(value)
+            texts.append((key.lower(), value))
             acc.raw_fields.append(raw)
         elif key:
-            texts.append(key)
+            texts.append((key.lower(), key))
     for extra in (sample.get("title"), sample.get("source_name")):
         if extra:
-            texts.append(str(extra))
+            texts.append(("description", str(extra)))
     if not texts:
         return acc
-    for text in texts:
+    terms = [t.term for t in lexicon_terms("disease", spec.disease)] + spec.disease if spec is not None else []
+    aliases = [alias for disease in (spec.disease if spec else []) for name, labels in DISEASE_LABELS.items()
+               if disease.casefold() == name.casefold() for alias in labels]
+    for key, text in texts:
         folded = _fold(text)
         if not folded or _AMBIGUOUS.match(folded):
             continue
-        _merge_trait_piece(acc, _traits_from_text(folded), text)
+        piece = _traits_from_text(folded)
+        if spec is not None and spec.disease:
+            if key in {"genotype", "treatment"}:
+                piece.pop("health", None)
+                piece.pop("control_token", None)
+            targets = terms + [a for a in aliases if key in GROUP_KEYS or len(_fold(a)) >= 5]
+            matches = [term for term in targets if _has_word(folded, term)]
+            negated = any(re.search(r"\b(?:no|without|non)\s+" + re.escape(_fold(term)) + r"\b", folded) for term in matches)
+            if matches:
+                piece["disease_state"] = "absent" if negated else "lesion"
+            elif piece.get("disease_state") == "lesion":
+                explicit = any(_has_word(folded, token) for token in ("lesion", "case", "disease", "diseased", "病例", "病变"))
+                if not explicit:
+                    piece.pop("disease_state", None)
+            if key in GROUP_KEYS and folded in {"hc", "ctrl", "con", "healthy control", "non diabetic", "uninfected"}:
+                piece.update(control_token=True, disease_state="absent")
+        _merge_trait_piece(acc, piece, text)
     return acc
 
 

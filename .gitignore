@@ -26,20 +26,14 @@ frontend/test-results/
 frontend/playwright-report/
 frontend/blob-report/
 frontend/playwright/.cache/
+/.playwright-browsers/
 
+# Local runtime. Only data/.gitkeep is part of the repo.
 backend/tests/_tmpdata/
-data/.internal_token
-**/.internal_token
 backend/data/
-data/*.db
-data/*.db-wal
-data/*.db-shm
-data/snapshots/
-data/exports/
-data/cache/
-data/live_stack/*.out
-data/live_stack/*.err
-data/review*/
+data/**
+!data/.gitkeep
+**/.internal_token
 *.xlsx
 !examples/**/*.xlsx
 

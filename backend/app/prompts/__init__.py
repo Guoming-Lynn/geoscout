@@ -1,13 +1,15 @@
 from pathlib import Path
 
 PROMPTS_DIR = Path(__file__).resolve().parent
+REVIEWER_PROMPTS = {"assess_dataset", "verify_dataset"}
 
 
 def load_prompt(name: str, version: str = "v1") -> str:
-    common = (PROMPTS_DIR / version / "common.txt").read_text(encoding="utf-8")
-    body = (PROMPTS_DIR / version / f"{name}.txt").read_text(encoding="utf-8")
-    parts = [common.strip(), body.strip()]
-    if name in {"assess_dataset", "verify_dataset"}:
-        schema = (PROMPTS_DIR / version / "json_assessment.txt").read_text(encoding="utf-8")
-        parts.append(schema.strip())
+    root = PROMPTS_DIR / version
+    parts = [(root / "common.txt").read_text(encoding="utf-8").strip()]
+    if name in REVIEWER_PROMPTS:
+        parts.append((root / "reviewer.txt").read_text(encoding="utf-8").strip())
+    parts.append((root / f"{name}.txt").read_text(encoding="utf-8").strip())
+    if name in REVIEWER_PROMPTS:
+        parts.append((root / "json_assessment.txt").read_text(encoding="utf-8").strip())
     return "\n\n".join(parts)

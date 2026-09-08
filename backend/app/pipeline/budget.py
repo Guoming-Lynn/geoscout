@@ -29,7 +29,7 @@ def estimate_tokens(text: str) -> int:
     return max(32, len(text) // 4)
 
 
-def check_before_external(run: Any, budget: Budget, *, next_action: str) -> None:
+def check_before_external(run: Any, budget: Budget, *, next_action: str, reserve: int = 0) -> None:
     """Raise BudgetStop if the next NCBI/LLM/FTP call must not be scheduled."""
     now = datetime.now(timezone.utc)
     started = getattr(run, "started_at", None)
@@ -46,6 +46,8 @@ def check_before_external(run: Any, budget: Budget, *, next_action: str) -> None
         if estimated:
             label += "（含估算用量，缺失值未当作 0）"
         raise BudgetStop(label, unfinished=next_action)
+    if reserve and total + reserve > budget.max_tokens:
+        raise BudgetStop("剩余 token 不足以完成一条完整核验（含输出与格式修复额度）", unfinished=next_action)
     counters = load(getattr(run, "counters_json", None), {})
     if next_action == "search" and int(counters.get("queries_done") or 0) >= budget.max_queries:
         raise BudgetStop("达到查询条数预算", unfinished=next_action)
@@ -55,3 +57,11 @@ def check_before_external(run: Any, budget: Budget, *, next_action: str) -> None
         raise BudgetStop("达到深核条目预算", unfinished=next_action)
     if next_action == "llm" and total >= budget.max_tokens:
         raise BudgetStop("达到 token 预算", unfinished=next_action)
+
+
+def review_token_reserve(budget: Budget, *, phase: str, input_tokens: int = 0) -> int:
+    """Tokens that must remain for a complete assess/verify (inputs, output, format repair)."""
+    output = int(budget.max_completion_tokens or 4096)
+    inp = max(0, int(input_tokens))
+    rounds = 2 if phase in {"assess", "assess_dataset"} else 1
+    return rounds * inp + (2 * rounds) * output

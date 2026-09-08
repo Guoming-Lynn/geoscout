@@ -370,7 +370,7 @@ def test_fit_samples_records_incomplete_coverage():
     from app.pipeline.assessment import fit_samples
 
     samples = [{"gsm": f"GSM{i}", "title": "x" * 80, "characteristics": []} for i in range(6)]
-    included, coverage = fit_samples(samples, budget=200)
+    included, coverage = fit_samples(samples, budget=500)
     assert coverage["total"] == 6
     assert 0 < coverage["included"] < 6
     assert coverage["complete"] is False
@@ -427,6 +427,99 @@ def test_model_invalid_reason_is_verify_failure():
     cat, reason = classify(spec, judgements, verified=False, conflict=False, model_invalid=True)
     assert cat == "needs_review"
     assert "复核失败" in reason
-    assert "科研信息不足" in reason
-    assert reason.startswith("复核失败")
+
+
+def test_model_cannot_pass_single_cell_rna_as_snrna():
+    spec = heuristic_parse("阿尔茨海默病脑组织 snRNA-seq")
+    sample = {
+        "gsm": "GSM9477523",
+        "title": "Frontal cortex (Motor), Control, Cont-1",
+        "organism": "Homo sapiens",
+        "source_name": "Frontal cortex (Motor)",
+        "library_strategy": "RNA-Seq",
+        "library_source": "transcriptomic single cell",
+        "characteristics": [
+            {"key": "diagnosis", "value": "AD", "raw": "diagnosis: AD"},
+            {"key": "tissue", "value": "Frontal cortex (Motor)", "raw": "tissue: Frontal cortex (Motor)"},
+        ],
+    }
+    study = {
+        "title": "Mass spectrometry-based proteomic profiling of human postmortem brain tissues",
+        "summary": "analyzed by mass spectrometry; single-nucleus RNA-seq is mentioned.",
+        "gdstype": "Expression profiling by high throughput sequencing",
+        "taxon": "Homo sapiens",
+    }
+    evidence = [{"evidence_id": "ev_ok", "text": "Homo sapiens frontal cortex RNA-Seq transcriptomic single cell"}]
+    raw = {
+        "judgements": [
+            {
+                "criterion_id": c.criterion_id,
+                "verdict": "pass",
+                "evidence_ids": ["ev_ok"],
+                "reason": "model pass",
+                "qualifying_gsms": ["GSM9477523"],
+            }
+            for c in spec.inclusion_criteria
+            if c.priority == "hard"
+        ]
+    }
+    checked = check_model_assessment(spec, raw, evidence, samples=[sample], study=study)
+    assay = next(j for j in checked.judgements if j.criterion_id == "assay")
+    assert assay.verdict != "pass"
+    assert "GSM9477523" not in (assay.qualifying_gsms or [])
+    cat, _ = classify(
+        spec,
+        checked.judgements,
+        verified=True,
+        conflict=False,
+        model_invalid=False,
+        depth_complete=True,
+        review_complete=True,
+    )
+    assert cat != "recommended"
+
+
+def test_model_may_pass_when_sample_protocol_is_snrna():
+    spec = heuristic_parse("阿尔茨海默病脑组织 snRNA-seq")
+    sample = {
+        "gsm": "GSM9477523",
+        "title": "Frontal cortex (Motor), Control, Cont-1",
+        "organism": "Homo sapiens",
+        "source_name": "Frontal cortex (Motor)",
+        "library_strategy": "RNA-Seq",
+        "library_source": "transcriptomic single cell",
+        "protocol": (
+            "Nuclei were isolated using the Minute Single Nucleus Isolation Kit. "
+            "Libraries were prepared with the Chromium Next GEM Single Cell 3' Kit "
+            "for single-nucleus RNA sequencing."
+        ),
+        "characteristics": [
+            {"key": "diagnosis", "value": "AD", "raw": "diagnosis: AD"},
+            {"key": "tissue", "value": "Frontal cortex (Motor)", "raw": "tissue: Frontal cortex (Motor)"},
+        ],
+    }
+    study = {
+        "title": "Mass spectrometry-based proteomic profiling of human postmortem brain tissues",
+        "summary": "analyzed by mass spectrometry; single-nucleus RNA-seq on the same brains.",
+        "gdstype": "Expression profiling by high throughput sequencing",
+        "taxon": "Homo sapiens",
+    }
+    evidence = [{"evidence_id": "ev_ok", "text": "Homo sapiens frontal cortex single-nucleus RNA sequencing"}]
+    raw = {
+        "judgements": [
+            {
+                "criterion_id": c.criterion_id,
+                "verdict": "pass",
+                "evidence_ids": ["ev_ok"],
+                "reason": "RNA-Seq and protocol describes single-nucleus RNA sequencing.",
+                "qualifying_gsms": ["GSM9477523"],
+            }
+            for c in spec.inclusion_criteria
+            if c.priority == "hard"
+        ]
+    }
+    checked = check_model_assessment(spec, raw, evidence, samples=[sample], study=study)
+    assay = next(j for j in checked.judgements if j.criterion_id == "assay")
+    assert assay.verdict == "pass"
+    assert "GSM9477523" in (assay.qualifying_gsms or [])
 

@@ -1,0 +1,12 @@
+^SERIES = GSE999001
+!Series_title = Cultured PBMC RNA-seq
+!Series_geo_accession = GSE999001
+!Series_summary = Peripheral blood mononuclear cells after in vitro culture
+^SAMPLE = GSMCULT1
+!Sample_title = Cultured PBMC
+!Sample_geo_accession = GSMCULT1
+!Sample_organism_ch1 = Homo sapiens
+!Sample_source_name_ch1 = PBMC
+!Sample_library_strategy = RNA-Seq
+!Sample_growth_protocol_ch1 = Cells were cultured in vitro for 14 days.
+!Sample_characteristics_ch1 = tissue: blood

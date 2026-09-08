@@ -7,27 +7,32 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.connectors.llm import LLMProvider
+from app import __version__
+from app.connectors.llm import LLMError, LLMProvider
 from app.core.config import settings
 from app.core.credentials import SessionCredentials, store
 from app.core.security import SESSION_COOKIE, require_internal_token
 from app.db.models import Assessment, Dataset, Event, Export, Job, Override, Project, QueryAttempt, Run, RunDataset, Sample
-from app.db.session import get_session
+from app.db.session import SessionLocal, get_session
 from app.evidence.store import evidence_bundle, new_id
 from app.exporters.service import create_export
+from app.pipeline.assay import study_assay_kinds
+from app.pipeline.assessment import applicable_gsms, judgement_from_assessment, sample_record
 from app.pipeline.engine import parse_spec_with_optional_llm
-from app.pipeline.repo import add_event, dump, enqueue_job, load
-from app.pipeline.spec_parse import heuristic_parse
+from app.pipeline.repo import add_event, clear_workspace, dump, enqueue_job, load
+from app.pipeline.spec_parse import heuristic_parse, _fill_criteria
+from app.core.usage import add_usage
 from app.schemas.spec import (
-    Budget,
     ConnectionConfigIn,
     ExportIn,
     OverrideIn,
     ProjectCreate,
     ResearchSpec,
     RunCreate,
+    resolve_run_budget,
 )
 from app.api.deps import browser_guard, session_creds
 from app.connectors.llm import PROMPT_VERSIONS
@@ -61,12 +66,18 @@ def _run_view(run: Run) -> dict:
 async def health() -> dict:
     return {
         "ok": True,
-        "version": "0.1.0",
+        "version": __version__,
         "ncbi_mode": settings.ncbi_mode,
         "llm_mode": settings.llm_mode,
         "demo": settings.demo_allowed(),
         "host": settings.host,
     }
+
+
+@router.get("/budget-presets")
+async def budget_presets() -> dict:
+    from app.schemas.spec import Budget
+    return {tier: Budget.preset(tier).model_dump() for tier in ("low", "medium", "high", "ultra")}
 
 
 @router.get("/connections")
@@ -107,6 +118,28 @@ async def test_connection(
     return await provider.test_connection()
 
 
+@router.post("/connections/models")
+async def list_connection_models(
+    body: ConnectionConfigIn,
+    creds: SessionCredentials = Depends(session_creds),
+) -> dict:
+    await save_connection(body, creds)
+    latest = store.get_or_create(creds.session_id)
+    mock = settings.llm_mode == "mock"
+    provider = LLMProvider(latest, mock=mock)
+    try:
+        return await provider.list_models()
+    except LLMError as exc:
+        return {"ok": False, "models": [], "message": str(exc)}
+
+
+@router.post("/workspace/clear")
+async def clear_workspace_api(db: AsyncSession = Depends(get_session)) -> dict:
+    deleted = await clear_workspace(db)
+    await db.commit()
+    return {"ok": True, "deleted": deleted}
+
+
 @router.get("/projects")
 async def list_projects(db: AsyncSession = Depends(get_session)) -> list[dict]:
     rows = (await db.execute(select(Project).order_by(Project.created_at.desc()))).scalars().all()
@@ -116,6 +149,7 @@ async def list_projects(db: AsyncSession = Depends(get_session)) -> list[dict]:
             "name": p.name,
             "original_request": p.original_request,
             "spec": load(p.spec_json, {}),
+            "parse_token_usage": load(p.parse_usage_json, {}),
             "created_at": p.created_at.isoformat() if p.created_at else None,
         }
         for p in rows
@@ -146,11 +180,19 @@ async def parse_spec(
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "课题不存在")
-    spec = await parse_spec_with_optional_llm(project.original_request, creds.session_id)
+    usage = {}
+
+    def record_parse_usage(item):
+        nonlocal usage
+        usage = add_usage(usage, item)
+
+    spec = await parse_spec_with_optional_llm(project.original_request, creds.session_id, on_usage=record_parse_usage)
+    project.parse_usage_json = dump(add_usage(load(project.parse_usage_json, {}), usage))
     project.spec_json = spec.model_dump_json()
     await db.commit()
     questions = spec.unresolved_questions[:3]
-    return {"spec": spec.model_dump(), "questions": questions, "llm_used": settings.llm_mode == "mock" or creds.has_llm_key()}
+    return {"spec": spec.model_dump(), "questions": questions, "llm_used": settings.llm_mode == "mock" or creds.has_llm_key(),
+            "token_usage": usage, "parse_token_usage": load(project.parse_usage_json, {})}
 
 
 @router.put("/projects/{project_id}/spec")
@@ -158,6 +200,7 @@ async def save_spec(project_id: str, body: ResearchSpec, db: AsyncSession = Depe
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "课题不存在")
+    _fill_criteria(body)
     project.spec_json = body.model_dump_json()
     await db.commit()
     return {"spec": body.model_dump()}
@@ -178,7 +221,12 @@ async def create_run(
     spec = ResearchSpec.model_validate(load(project.spec_json, {}))
     if not spec.original_request:
         spec.original_request = project.original_request
-    budget = body.budget or Budget()
+    budget, budget_tier = resolve_run_budget(body.one_click, body.budget, body.tier)
+    if body.deep_limit is not None and body.budget is None:
+        if body.deep_limit > budget.max_unique_gse:
+            raise HTTPException(422, "深核数量不能超过候选数量上限")
+        budget.max_deep_verify = body.deep_limit
+        budget_tier = "custom"
     if body.mode == "manual_query":
         if not body.manual_query:
             raise HTTPException(400, "手工检索需要英文检索词")
@@ -197,11 +245,14 @@ async def create_run(
             {
                 "manual_query": body.manual_query,
                 "one_click": body.one_click,
+                "budget_tier": budget_tier,
+                "base_tier": body.tier,
                 "demo": bool(body.demo),
                 "ncbi_mode": "mock" if body.demo else settings.ncbi_mode,
                 "llm_mode": settings.llm_mode,
                 "llm_model": creds.llm_model,
                 "llm_base_url": creds.llm_base_url,
+                "parse_token_usage": load(project.parse_usage_json, {}),
             }
         ),
     )
@@ -267,29 +318,47 @@ async def resume_run(run_id: str, db: AsyncSession = Depends(get_session)) -> di
 
 @router.post("/runs/{run_id}/cancel")
 async def cancel_run(run_id: str, db: AsyncSession = Depends(get_session)) -> dict:
-    run = await db.get(Run, run_id)
-    if not run:
-        raise HTTPException(404, "任务不存在")
-    run.cancel_requested = True
-    await add_event(db, run.id, "已请求取消。模型若已发出请求，费用无法退回。")
-    await db.commit()
-    return _run_view(run)
+    for attempt in range(3):
+        try:
+            run = await db.get(Run, run_id)
+            if not run:
+                raise HTTPException(404, "任务不存在")
+            if not run.cancel_requested:
+                run.cancel_requested = True
+                await add_event(db, run.id, "已请求取消。模型若已发出请求，费用无法退回。")
+            await db.commit()
+            return _run_view(run)
+        except OperationalError as exc:
+            await db.rollback()
+            if "locked" not in str(exc.orig).lower() and "busy" not in str(exc.orig).lower():
+                raise
+            # Restart the transaction: retrying a failed SQLite snapshot cannot succeed.
+            if attempt == 2:
+                raise HTTPException(503, "数据库繁忙，取消请求尚未保存，请稍后重试。", headers={"Retry-After": "2"}) from exc
+            await asyncio.sleep(0.2 * (attempt + 1))
 
 
 @router.get("/runs/{run_id}/events")
-async def sse_events(run_id: str, request: Request, db: AsyncSession = Depends(get_session)) -> StreamingResponse:
+async def sse_events(run_id: str, request: Request) -> StreamingResponse:
     last = request.headers.get("last-event-id") or request.query_params.get("last_event_id") or "0"
+    try:
+        initial_cursor = max(0, int(last))
+    except ValueError:
+        raise HTTPException(400, "事件游标必须是整数")
+    async with SessionLocal() as db:
+        if await db.get(Run, run_id) is None:
+            raise HTTPException(404, "任务不存在")
 
     async def gen():
-        cursor = int(last or 0)
+        cursor = initial_cursor
         while True:
-            async with db.bind.connect() as _conn:  # keep session usable
-                pass
-            rows = (
-                await db.execute(
-                    select(Event).where(Event.run_id == run_id, Event.id > cursor).order_by(Event.id.asc())
-                )
-            ).scalars().all()
+            if await request.is_disconnected():
+                break
+            # Release the connection before yielding or waiting on the browser.
+            async with SessionLocal() as db:
+                rows = (await db.execute(select(Event).where(Event.run_id == run_id, Event.id > cursor).order_by(Event.id.asc()))).scalars().all()
+                run = await db.get(Run, run_id)
+                status = run.status if run else None
             for row in rows:
                 cursor = row.id
                 payload = {
@@ -299,9 +368,8 @@ async def sse_events(run_id: str, request: Request, db: AsyncSession = Depends(g
                     "created_at": row.created_at.isoformat() if row.created_at else None,
                 }
                 yield f"id: {row.id}\nevent: log\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            run = await db.get(Run, run_id)
-            if run and run.status in {"completed", "partial", "failed", "cancelled"}:
-                yield f"event: done\ndata: {json.dumps({'status': run.status})}\n\n"
+            if status is None or status in {"completed", "partial", "failed", "cancelled"}:
+                yield f"event: done\ndata: {json.dumps({'status': status or 'deleted'})}\n\n"
                 break
             await asyncio.sleep(0.6)
 
@@ -311,13 +379,15 @@ async def sse_events(run_id: str, request: Request, db: AsyncSession = Depends(g
 @router.get("/runs/{run_id}/queries")
 async def list_queries(run_id: str, db: AsyncSession = Depends(get_session)) -> list[dict]:
     rows = (
-        await db.execute(select(QueryAttempt).where(QueryAttempt.run_id == run_id).order_by(QueryAttempt.round_no))
+        await db.execute(select(QueryAttempt).where(QueryAttempt.run_id == run_id).order_by(QueryAttempt.query_index, QueryAttempt.id))
     ).scalars().all()
     return [
         {
             "id": q.id,
             "term": q.term,
             "round_no": q.round_no,
+            "query_index": q.query_index,
+            "candidate_limit": q.candidate_limit,
             "source": q.source,
             "hit_count": q.hit_count,
             "new_unique_gse": q.new_unique_gse,
@@ -343,29 +413,48 @@ async def list_datasets(
     if category:
         stmt = stmt.where(RunDataset.category == category)
     rows = (await db.execute(stmt)).scalars().all()
+    gse_ids = [rd.gse for rd in rows]
+    sample_stubs: dict[str, list[dict]] = {}
+    if gse_ids:
+        sample_rows = (
+            await db.execute(select(Sample.gse, Sample.library_strategy).where(Sample.gse.in_(gse_ids)).distinct())
+        ).all()
+        for gse, strategy in sample_rows:
+            if strategy:
+                sample_stubs.setdefault(gse, []).append({"library_strategy": strategy})
     items = []
     for rd in rows:
         ds = await db.get(Dataset, rd.gse)
         title = ds.title if ds else ""
         if q and q.lower() not in (rd.gse + title).lower():
             continue
+        study = {
+            "title": title,
+            "summary": ds.summary if ds else "",
+            "gdstype": ds.gdstype if ds else "",
+        }
+        kinds = study_assay_kinds(study, sample_stubs.get(rd.gse))
         items.append(
             {
                 "gse": rd.gse,
                 "title": title,
                 "taxon": ds.taxon if ds else "",
                 "gdstype": ds.gdstype if ds else "",
+                "assay_kind": kinds[0],
+                "assay_kinds": kinds,
                 "n_samples": ds.n_samples if ds else None,
                 "category": rd.category,
                 "verification_status": rd.verification_status,
                 "reason": rd.reason,
                 "hard_unknowns": rd.hard_unknowns,
                 "soft_score": rd.soft_score,
+                "selection": load(rd.first_assess_json, {}).get("selection", {}),
                 "independent_donors": rd.independent_donors,
                 "processed_data": rd.processed_data,
             }
         )
     total = len(items)
+    items.sort(key=lambda item: (-item["selection"].get("score", 0), item["gse"]))
     return {"total": total, "items": items[offset : offset + limit]}
 
 
@@ -385,6 +474,25 @@ async def dataset_detail(run_id: str, gse: str, db: AsyncSession = Depends(get_s
     ov = (
         await db.execute(select(Override).where(Override.run_id == run_id, Override.gse == rd.gse))
     ).scalar_one_or_none()
+    run = await db.get(Run, run_id)
+    run_spec = ResearchSpec.model_validate(load(run.spec_snapshot, {})) if run else ResearchSpec()
+    hard_ids = {c.criterion_id for c in run_spec.inclusion_criteria if c.priority == "hard"}
+    sample_dicts = [sample_record(s) for s in samples]
+    study = {
+        "taxon": ds.taxon if ds else "",
+        "gdstype": ds.gdstype if ds else "",
+        "summary": ds.summary if ds else "",
+    }
+    assay_kinds = study_assay_kinds(
+        {
+            "title": ds.title if ds else "",
+            "summary": ds.summary if ds else "",
+            "gdstype": ds.gdstype if ds else "",
+        },
+        sample_dicts,
+    )
+    finals = [a for a in assessments if a.stage == "final"]
+    cohort = applicable_gsms(run_spec, [judgement_from_assessment(a) for a in finals], sample_dicts, study)
     return {
         "gse": rd.gse,
         "url": f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={rd.gse}",
@@ -393,12 +501,15 @@ async def dataset_detail(run_id: str, gse: str, db: AsyncSession = Depends(get_s
             "summary": ds.summary if ds else "",
             "taxon": ds.taxon if ds else "",
             "gdstype": ds.gdstype if ds else "",
+            "assay_kind": assay_kinds[0],
+            "assay_kinds": assay_kinds,
             "gpl": ds.gpl if ds else "",
             "n_samples": ds.n_samples if ds else None,
             "pubmed_ids": load(ds.pubmed_ids, []) if ds else [],
             "ftplink": ds.ftplink if ds else "",
         },
         "run_dataset": {
+            "selection": load(rd.first_assess_json, {}).get("selection", {}),
             "category": rd.category,
             "verification_status": rd.verification_status,
             "reason": rd.reason,
@@ -412,19 +523,9 @@ async def dataset_detail(run_id: str, gse: str, db: AsyncSession = Depends(get_s
             "soft_score": rd.soft_score,
             "conflict": load(rd.conflict_json, []),
             "model_output_invalid": rd.model_output_invalid,
-            "applicable_gsms": sorted(
-                set.intersection(
-                    *[
-                        {str(gsm) for gsm in load(getattr(a, "qualifying_gsms_json", None), []) if gsm}
-                        for a in assessments
-                        if a.stage == "final" and load(getattr(a, "qualifying_gsms_json", None), [])
-                    ]
-                )
-            )
-            if any(a.stage == "final" and load(getattr(a, "qualifying_gsms_json", None), []) for a in assessments)
-            else [],
+            "applicable_gsms": cohort,
             "unknown_hard": [
-                a.criterion_id for a in assessments if a.stage == "final" and a.verdict == "unknown"
+                a.criterion_id for a in assessments if a.stage == "final" and a.verdict == "unknown" and a.criterion_id in hard_ids
             ],
         },
         "samples": [

@@ -15,6 +15,7 @@ from app.db.models import Assessment, Dataset, DatasetRelation, Export, Override
 from app.evidence.store import evidence_bundle, new_id
 from app.exporters.audit import write_audit_pack
 from app.exporters.excel import safe_filename, write_workbook
+from app.pipeline.assessment import applicable_gsms, judgement_from_assessment, sample_record
 from app.pipeline.repo import dump, load
 from app.schemas.spec import ResearchSpec
 
@@ -75,6 +76,7 @@ async def build_export_payload(session: AsyncSession, run: Run) -> dict[str, Any
                     "organism": s.organism,
                     "source_name": s.source_name,
                     "donor_key": s.donor_key,
+                    "library_strategy": s.library_strategy,
                     "characteristics": load(s.characteristics_json, []),
                     "coverage_incomplete": s.coverage_incomplete,
                 }
@@ -83,17 +85,21 @@ async def build_export_payload(session: AsyncSession, run: Run) -> dict[str, Any
     evid = {row["evidence_id"]: row for row in await evidence_bundle(session, run.id)}
     spec_obj = ResearchSpec.model_validate(spec) if spec else ResearchSpec()
     hard_ids = {c.criterion_id for c in spec_obj.inclusion_criteria if c.priority == "hard"}
+    samples_by_gse: dict[str, list] = {}
+    for row in samples_out:
+        samples_by_gse.setdefault(row["gse"], []).append(row)
     for cand in candidates:
         finals = [a for a in assess_rows if a.gse == cand["gse"] and a.stage == "final"]
-        subsets = []
-        unknown_hard = []
-        for a in finals:
-            gsms = load(getattr(a, "qualifying_gsms_json", None), [])
-            if gsms:
-                subsets.append(set(str(x) for x in gsms))
-            if a.verdict == "unknown" and a.criterion_id in hard_ids:
-                unknown_hard.append(a.criterion_id)
-        cand["applicable_gsms"] = sorted(set.intersection(*subsets)) if subsets else []
+        unknown_hard = [
+            a.criterion_id for a in finals if a.verdict == "unknown" and a.criterion_id in hard_ids
+        ]
+        study = {"taxon": cand.get("taxon") or "", "gdstype": cand.get("gdstype") or "", "summary": ""}
+        cand["applicable_gsms"] = applicable_gsms(
+            spec_obj,
+            [judgement_from_assessment(a) for a in finals],
+            samples_by_gse.get(cand["gse"], []),
+            study,
+        )
         cand["unknown_hard"] = unknown_hard
         missing_eids = []
         for a in finals:
@@ -124,7 +130,7 @@ async def build_export_payload(session: AsyncSession, run: Run) -> dict[str, Any
                 "qualifying_gsms": load(getattr(a, "qualifying_gsms_json", None), []),
             }
         )
-    queries = (await session.execute(select(QueryAttempt).where(QueryAttempt.run_id == run.id))).scalars().all()
+    queries = (await session.execute(select(QueryAttempt).where(QueryAttempt.run_id == run.id).order_by(QueryAttempt.query_index, QueryAttempt.id))).scalars().all()
     cfg = load(run.config_summary, {})
     return {
         "demo": bool(cfg.get("demo")),
@@ -143,6 +149,8 @@ async def build_export_payload(session: AsyncSession, run: Run) -> dict[str, Any
         "queries": [
             {
                 "round_no": q.round_no,
+                "query_index": q.query_index,
+                "candidate_limit": q.candidate_limit,
                 "source": q.source,
                 "term": q.term,
                 "query_translation": q.query_translation,

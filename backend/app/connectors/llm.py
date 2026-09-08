@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from typing import Any
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 
 from app.core.credentials import SessionCredentials
 from app.core.redact import redact_text
+from app.core.usage import add_usage
 from app.schemas.spec import ModelAssessment
 
 logger = logging.getLogger("geoscout.llm")
@@ -24,16 +26,22 @@ PROMPT_VERSIONS = {
 
 
 class LLMError(Exception):
-    def __init__(self, message: str, status_code: int | None = None, retryable: bool = False) -> None:
+    def __init__(self, message: str, status_code: int | None = None, retryable: bool = False, kind: str = "output") -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+        self.kind = kind
+        self.usage: dict[str, Any] = {}
 
 
 class LLMProvider:
-    def __init__(self, creds: SessionCredentials, *, mock: bool = False) -> None:
+    def __init__(self, creds: SessionCredentials, *, mock: bool = False,
+                 on_usage: Callable[[dict[str, Any]], None] | None = None,
+                 before_request: Callable[[dict[str, Any]], None] | None = None) -> None:
         self.creds = creds
         self.mock = mock
+        self.on_usage = on_usage
+        self.before_request = before_request
 
     async def complete_json(
         self,
@@ -47,6 +55,8 @@ class LLMProvider:
         if self.mock:
             payload = _mock_payload(prompt_name, user)
             usage = {"prompt_tokens": 0, "completion_tokens": 0, "estimated": False, "source": "mock"}
+            if self.on_usage:
+                self.on_usage(usage)
             return payload, usage
         if not self.creds.llm_api_key:
             raise LLMError("未提供模型 API Key", status_code=401)
@@ -56,6 +66,7 @@ class LLMProvider:
             {"role": "user", "content": user},
         ]
         last_error: LLMError | None = None
+        total: dict[str, Any] = {}
         for body in _completion_bodies(
             self.creds.llm_base_url,
             model=self.creds.llm_model,
@@ -64,19 +75,44 @@ class LLMProvider:
             prompt_name=prompt_name,
             max_tokens=max_output_tokens or 4096,
         ):
+            if self.before_request:
+                self.before_request(body)
+            accounted = False
             try:
                 data, usage = await self._post(body, allow_schema_fallback=False)
+                measured = self._measure_usage(body, usage)
+                total = add_usage(total, measured)
+                accounted = True
                 content = _message_content(data)
                 if not content.strip():
                     raise LLMError("模型返回空 content", retryable=True)
-                return _loads_json_object(content), usage
+                return _loads_json_object(content), {**total, "source": "estimated" if total.get("estimated") else "provider"}
             except LLMError as exc:
+                if not accounted:
+                    total = add_usage(total, self._measure_usage(body, {}))
+                exc.usage = total
                 last_error = exc
-                if exc.status_code in {401, 403}:
+                if exc.status_code in {401, 403} or exc.kind == "network":
                     raise
                 continue
         assert last_error is not None
         raise last_error
+
+    def _measure_usage(self, body: dict[str, Any], usage: dict[str, Any]) -> dict[str, Any]:
+        missing = usage.get("prompt_tokens") is None or usage.get("completion_tokens") is None
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+        if prompt is None:
+            prompt = max(32, len(json.dumps(body.get("messages", []), ensure_ascii=False)) // 4)
+        if completion is None:
+            # Unknown output is conservatively reserved, never displayed as zero cost.
+            completion = int(body.get("max_tokens") or 4096)
+        measured = {"prompt_tokens": int(prompt), "completion_tokens": int(completion),
+                    "estimated": bool(missing or usage.get("estimated")), "request_count": 1,
+                    "missing_usage_requests": int(missing)}
+        if self.on_usage:
+            self.on_usage(measured)
+        return measured
 
     async def test_connection(self) -> dict[str, Any]:
         if self.mock:
@@ -149,8 +185,58 @@ class LLMProvider:
                 "model": self.creds.llm_model,
                 "target": redact_text(self.creds.llm_base_url),
                 "message": str(exc),
+                "usage": exc.usage,
                 "hint": _hint_for(exc),
             }
+
+    async def list_models(self) -> dict[str, Any]:
+        if self.mock:
+            return {
+                "ok": True,
+                "models": ["mock-model"],
+                "message": "当前为 mock 模型模式，未向外部请求模型列表。",
+            }
+        if not self.creds.llm_base_url.strip():
+            return {"ok": False, "models": [], "message": "请先填写模型 Base URL。"}
+        if not self.creds.llm_api_key:
+            return {"ok": False, "models": [], "message": "请先填写模型 API Key。"}
+        url = models_url(self.creds.llm_base_url)
+        headers = {
+            "Authorization": f"Bearer {self.creds.llm_api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.creds.llm_timeout_s) as client:
+                response = await client.get(url, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise LLMError("拉取模型列表超时", retryable=True) from exc
+        except httpx.HTTPError as exc:
+            raise LLMError(f"拉取模型列表网络错误: {exc}", retryable=True) from exc
+        if response.status_code in {401, 403}:
+            return {
+                "ok": False,
+                "models": [],
+                "target": redact_text(url),
+                "message": "模型认证失败，请检查 API Key 与 Base URL。",
+            }
+        if response.status_code >= 400:
+            return {
+                "ok": False,
+                "models": [],
+                "target": redact_text(url),
+                "message": f"该接口不提供模型列表（HTTP {response.status_code}）。请手工填写模型名。",
+            }
+        try:
+            payload = response.json()
+        except ValueError:
+            return {"ok": False, "models": [], "message": "模型列表不是 JSON。"}
+        models = parse_model_ids(payload)
+        return {
+            "ok": True,
+            "models": models,
+            "target": redact_text(url),
+            "message": f"找到 {len(models)} 个模型。" if models else "已连接，但列表为空，请手工填写模型名。",
+        }
 
     async def _post(self, body: dict[str, Any], *, allow_schema_fallback: bool) -> tuple[dict[str, Any], dict[str, Any]]:
         url = self.creds.llm_base_url.rstrip("/") + "/chat/completions"
@@ -162,18 +248,24 @@ class LLMProvider:
             async with httpx.AsyncClient(timeout=self.creds.llm_timeout_s) as client:
                 response = await client.post(url, headers=headers, json=body)
         except httpx.TimeoutException as exc:
-            raise LLMError("模型请求超时", retryable=True) from exc
+            raise LLMError("模型请求超时", retryable=True, kind="network") from exc
         except httpx.HTTPError as exc:
-            raise LLMError(f"模型网络错误: {exc}", retryable=True) from exc
+            raise LLMError(f"模型网络错误: {exc}", retryable=True, kind="network") from exc
         if response.status_code in {401, 403}:
             raise LLMError("模型认证失败，请检查 API Key 与 Base URL", status_code=response.status_code)
         if response.status_code >= 400:
             text = response.text[:400]
             if allow_schema_fallback and response.status_code == 400:
                 raise LLMError(f"response_format 不被支持: {text}", status_code=400)
-            raise LLMError(f"模型 HTTP {response.status_code}: {text}", status_code=response.status_code)
-        data = response.json()
-        usage_raw = data.get("usage") or {}
+            raise LLMError(f"模型 HTTP {response.status_code}: {redact_text(text)}", status_code=response.status_code,
+                           kind="network" if response.status_code >= 500 or response.status_code == 429 else "output")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise LLMError("模型响应不是 JSON") from exc
+        if not isinstance(data, dict):
+            raise LLMError("模型响应必须是 JSON 对象")
+        usage_raw = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         usage = {
             "prompt_tokens": usage_raw.get("prompt_tokens"),
             "completion_tokens": usage_raw.get("completion_tokens"),
@@ -182,6 +274,34 @@ class LLMProvider:
             "source": "provider" if usage_raw else "missing",
         }
         return data, usage
+
+
+def models_url(base_url: str) -> str:
+    return base_url.rstrip("/") + "/models"
+
+
+def parse_model_ids(payload: Any) -> list[str]:
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        raw = payload.get("data")
+        if not isinstance(raw, list):
+            raw = payload.get("models")
+        items = raw if isinstance(raw, list) else []
+    else:
+        items = []
+    ids: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        name = item if isinstance(item, str) else None
+        if isinstance(item, dict):
+            value = item.get("id") or item.get("name") or item.get("model")
+            name = str(value) if value else None
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ids.append(name)
+    return ids
 
 
 def _deepseek_host(base_url: str) -> bool:
@@ -220,8 +340,7 @@ def _completion_bodies(
             "response_format": {"type": "json_object"},
         }
         bodies.append(deepseek)
-        bodies.append({k: v for k, v in deepseek.items() if k != "thinking"})
-        bodies.append(base)
+        bodies.append({**base, "thinking": {"type": "disabled"}})
         return bodies
     if schema:
         bodies.append(

@@ -1,8 +1,15 @@
 每个 inclusion_criteria 的 criterion_id 必须恰好一条 judgement。
 每条必须含字段：criterion_id、verdict、evidence_ids、quote、reason。
+groups、硬性 tissue、sample_source 的 pass 必须有 qualifying_gsms 数组。混合物种或混合技术研究中，每个样本级硬条件的 pass 也必须列出 qualifying_gsms。groups 列出完整比较队列；organism/assay/tissue/sample_source 应覆盖这个队列，disease 可以只列目标病例。不要只在 reason 中口头说已找到。groups 的 quotes 数组与 evidence_ids 按位置对应，分别引用病例与对照的样本原文。有硬性供体数量要求时，不能用单个示例代替供体核验。
 verdict 字段名必须是 verdict，取值只能是 pass、fail、unknown，不得省略、不得写成 maybe 或其他词。
 根对象必须是：
-{"judgements":[{"criterion_id":"","verdict":"pass|fail|unknown","evidence_ids":[],"quote":"","reason":""}],"concerns":[],"missing":[]}
+{"judgements":[{"criterion_id":"","verdict":"pass|fail|unknown","evidence_ids":[],"quote":"","quotes":[],"qualifying_gsms":[],"reason":""}],"concerns":[],"missing":[]}
 不要包在 assessments、assess_dataset、assess_result、verify_result 或其他键里。
 quote 必须是对应证据或 samples[] 原文的连续子串，不能改写。
 pass/fail 必须引用输入中存在的 evidence_id。
+
+Output citation check before returning JSON:
+- Copy each quote from the exact record named by evidence_ids at the same index. Do not combine snippets from separate sentences, records, or fields into a single quote.
+- Prefer a short distinctive contiguous raw field value, preserving its original punctuation and spelling. Explain abbreviations in reason, never by rewriting the quoted field.
+- For groups=pass, use at least one case sample evidence_id and one control sample evidence_id with equally many quotes. Copy these IDs from those specific samples, not from the study summary.
+- If a quoted snippet does not occur in that specific record, select a supported quote and matching ID, or return unknown. Never supply a plausible reconstruction of the source.

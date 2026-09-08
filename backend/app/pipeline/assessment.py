@@ -1,23 +1,32 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
+from collections import Counter, defaultdict, deque
 from typing import Any
 
 from app.connectors.llm import LLMError, validate_assessment
 from app.evidence.store import quote_in_text
-from app.pipeline.assay import assay_relation, infer_sample_assay
-from app.pipeline.donors import infer_group_label, _organism_ok
+from app.pipeline.assay import assay_method_relation, assay_relation, infer_sample_assay, sample_method_relation
+from app.pipeline.donors import donors_per_group, infer_group_label, _organism_ok
+from app.pipeline.lexicon import lexicon_terms
+from app.pipeline.source import source_kind, tissue_matches
 from app.schemas.spec import CriterionJudgement, ModelAssessment, ResearchSpec
 
-DETERMINISTIC_FIELDS = {"organism", "donors", "assay", "age", "sex"}
+DETERMINISTIC_FIELDS = {"organism", "donors", "assay", "assay_method", "age", "sex", "tissue", "sample_source"}
 # Fail on these requires citing GSM/sample evidence; abstract absence is unknown.
 SAMPLE_FAIL_FIELDS = {"groups", "donors", "donors_per_group", "age", "sex", "assay"}
 # Screen-time NCBI gdstype/taxon fail may still exclude without SOFT samples.
 ABSTRACT_CANNOT_FAIL = {"groups", "donors", "donors_per_group", "age", "sex"}
+CASE_EVIDENCE_FIELDS = {"disease"}
+COHORT_FIELDS = {"groups", "donors"}
+SAMPLE_CONSTRAINT_FIELDS = {"organism", "assay", "assay_method", "sample_source", "tissue", "age", "sex"}
+AGE_KEYS = {"age", "age (years)", "age_years", "age (yrs)", "donor age", "patient age", "age (y)"}
+SEX_KEYS = {"sex", "gender", "biological sex", "sex (female/male)", "donor sex"}
 
 
-SAMPLE_CHAR_BUDGET = 20_000
+SAMPLE_CHAR_BUDGET = 40_000
 _MOUSE_TOKENS = ("murine", "mouse", "mus musculus", "小鼠")
 _HUMAN_TOKENS = ("homo sapiens", "human", "人类")
 
@@ -58,7 +67,9 @@ def _compact_sample(row: dict[str, Any], *, evidence_id: str = "") -> dict[str, 
         "group_label": row.get("group_label"),
         "library_strategy": row.get("library_strategy") or "",
         "library_source": row.get("library_source") or "",
-        "characteristics": row.get("characteristics") or [],
+        "protocol": row.get("protocol") or "",
+        "characteristics": [str(c.get("raw") or f"{c.get('key', '')}: {c.get('value', '')}")
+                            if isinstance(c, dict) else str(c) for c in row.get("characteristics") or []],
     }
     if evidence_id:
         compact["evidence_id"] = evidence_id
@@ -70,24 +81,37 @@ def fit_samples(
     *,
     budget: int = SAMPLE_CHAR_BUDGET,
     evidence: list[dict[str, Any]] | None = None,
+    spec: ResearchSpec | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Send complete GSM records only. Record coverage; do not silently drop the remainder."""
+    """Interleave groups within the byte budget; never truncate a sample record."""
     ids = _sample_evidence_ids(evidence or [])
     included: list[dict[str, Any]] = []
     used = 2
+    buckets = defaultdict(deque)
     for row in samples:
+        label = infer_group_label(row, spec=spec) if spec is not None else row.get("group_label")
+        key = (label or "unknown", str(row.get("organism") or ""), str(row.get("library_strategy") or ""))
+        buckets[key].append((row, label))
+    ordered = []
+    while buckets:
+        for key in list(buckets):
+            ordered.append(buckets[key].popleft())
+            if not buckets[key]:
+                del buckets[key]
+    for row, label in ordered:
         gsm = str(row.get("gsm") or "").upper()
         compact = _compact_sample(row, evidence_id=ids.get(gsm, ""))
-        size = len(json.dumps(compact, ensure_ascii=False))
-        if included and used + size > budget:
-            break
+        compact["group_label"] = label
+        size = len(json.dumps(compact, ensure_ascii=False)) + (2 if included else 0)
+        if used + size > budget:
+            continue
         included.append(compact)
         used += size
     total = len(samples)
     return included, {
         "total": total,
         "included": len(included),
-        "complete": len(included) == total,
+        "complete": len(included) == total and not any(s.get("coverage_incomplete") for s in samples),
     }
 
 
@@ -104,11 +128,19 @@ def judge_user_payload(
     samples: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Payload for assess/verify. Sample records live in samples[]; evidence is study-level only."""
-    included, coverage = fit_samples(samples, evidence=evidence)
+    included, coverage = fit_samples(samples, evidence=evidence, spec=spec)
+    group_counts = Counter(infer_group_label(s, spec=spec) or "unknown" for s in samples)
     return {
         "gse": gse,
         "sample_records_available": bool(samples),
         "sample_coverage": coverage,
+        "group_definitions": {
+            g: ("Target-disease case group; this label does not add an anatomical lesion requirement."
+                if g in {"case", "disease", "lesion"} else "Comparator group as defined by the research criteria; treatment controls are not automatically healthy controls.")
+            for g in spec.required_groups
+        },
+        "group_inventory": {"gsm_counts": dict(group_counts), "source_records_complete": not any(s.get("coverage_incomplete") for s in samples),
+                            "note": "Derived grouping of all downloaded GSM records, not donor counts or eligibility proof; unknown labels are retained."},
         "spec": spec.model_dump(),
         "summary": {
             "title": summary.get("title") or "",
@@ -170,6 +202,7 @@ def check_model_assessment(
             _demote_source_conflict(item, evidence, study)
             criterion = next(c for c in spec.inclusion_criteria if c.criterion_id == cid)
             _bind_qualifying_gsms(item, spec, criterion, samples, study=study)
+            _guard_subset_failure(item, spec, samples, study, sample_coverage)
             by_id[cid] = item
     except LLMError as exc:
         filled = _unknown_all(spec, str(exc))
@@ -347,6 +380,55 @@ def _demote_incomplete_sample_coverage(
         item.reason = "样本记录未完整纳入模型输入，不能据此推荐。"
 
 
+def _guard_subset_failure(
+    item: CriterionJudgement, spec: ResearchSpec, samples: list[dict[str, Any]] | None,
+    study: dict[str, Any] | None, coverage: dict[str, Any] | None = None,
+) -> None:
+    """A failed subset is not proof that every usable subset fails."""
+    if item.verdict != "fail":
+        return
+    field = next((c.field for c in spec.inclusion_criteria if c.criterion_id == item.criterion_id), item.criterion_id)
+    if field not in {"organism", "assay", "assay_method", "disease", "tissue", "groups", "donors"}:
+        return
+    samples = samples or []
+    incomplete = (coverage is not None and not coverage.get("complete", True)) or any(s.get("coverage_incomplete") for s in samples)
+    taxon = str((study or {}).get("taxon") or "")
+    taxa = [s.strip() for s in taxon.replace(";", ",").split(",") if s.strip()]
+    matching = [s for s in samples if _organism_ok(s, spec.organisms) is True]
+    other = [s for s in samples if _organism_ok(s, spec.organisms) is False]
+    mixed = (bool(matching) and bool(other)) or len(taxa) > 1
+    protect = incomplete
+    if field == "organism":
+        summary_match = any(_organism_ok({"organism": t}, spec.organisms) is True for t in taxa)
+        protect |= bool(matching) or summary_match
+    elif field == "assay":
+        possible = [s for s in samples if _organism_ok(s, spec.organisms) is not False]
+        protect |= any(assay_relation(list(spec.assay_types), infer_sample_assay(s, study)) != "contradict" for s in possible)
+        protect |= mixed
+    elif field == "assay_method":
+        possible = [s for s in samples if _organism_ok(s, spec.organisms) is not False]
+        protect |= any(
+            sample_method_relation(list(spec.assay_methods), s) != "contradict"
+            for s in possible
+        )
+        protect |= mixed
+    elif field in {"disease", "tissue"}:
+        # A target label in any eligible sample contradicts a whole-study exclusion.
+        seeds = spec.disease if field == "disease" else spec.tissues
+        terms = [t.term.casefold() for t in lexicon_terms(field, seeds)] + [s.casefold() for s in seeds]
+        protect |= mixed or any(
+            term and re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", json.dumps(s, ensure_ascii=False).casefold())
+            for s in samples if _organism_ok(s, spec.organisms) is not False
+            for term in terms
+        )
+    else:
+        protect |= mixed
+    if protect:
+        item.verdict = "unknown"
+        item.clue_only = True
+        item.reason = "现有证据未排除目标样本子集，或样本覆盖不完整；不能把研究整体排除。原判断：" + item.reason
+
+
 def _bind_qualifying_gsms(
     item: CriterionJudgement,
     spec: ResearchSpec,
@@ -389,8 +471,20 @@ def _bind_qualifying_gsms(
                 assay_notes.append(f"{gsm} 仅有 {call.evidence or '不足'} 证据，不能证明 {','.join(spec.assay_types)}")
                 continue
             item.support_text = item.support_text or call.evidence
+        if field == "assay_method" and spec.assay_methods:
+            call = infer_sample_assay(sample, None)
+            rel = sample_method_relation(list(spec.assay_methods), sample)
+            if rel == "contradict":
+                contradict.append(gsm)
+                assay_notes.append(f"{gsm} 为 {'/'.join(call.methods) or call.kind}，与要求 {','.join(spec.assay_methods)} 矛盾")
+                continue
+            if rel == "insufficient":
+                insufficient.append(gsm)
+                assay_notes.append(f"{gsm} 不能证明 {','.join(spec.assay_methods)}")
+                continue
+            item.support_text = item.support_text or " / ".join(call.methods) or call.evidence
         kept.append(gsm)
-    if field == "assay" and spec.assay_types:
+    if field in {"assay", "assay_method"} and (spec.assay_types if field == "assay" else spec.assay_methods):
         if contradict and not kept:
             item.verdict = "fail"
             item.reason = "；".join(assay_notes) or "列出的 GSM 与要求的细分技术矛盾。"
@@ -398,7 +492,7 @@ def _bind_qualifying_gsms(
             return
         if not kept:
             item.verdict = "unknown"
-            item.reason = "；".join(assay_notes) or "RNA-Seq 不能单独证明 bulk/sc/sn。"
+            item.reason = "；".join(assay_notes) or "列出的 GSM 不能证明要求的具体实验方法。"
             item.qualifying_gsms = []
             item.clue_only = True
             return
@@ -417,6 +511,123 @@ def _bind_qualifying_gsms(
     item.qualifying_gsms = kept
 
 
+def _criterion_map(spec: ResearchSpec) -> dict[str, Any]:
+    return {c.criterion_id: c for c in spec.inclusion_criteria}
+
+
+def _is_sample_constraint(field: str) -> bool:
+    return _cohort_constraint(field)
+
+
+def _cohort_constraint(field: str) -> bool:
+    """Hard fields that name a GSM subset must share one comparable cohort."""
+    return field not in CASE_EVIDENCE_FIELDS and field not in COHORT_FIELDS and field != "donors_per_group"
+
+
+def _clinical_keys(field: str, user_text: str = "") -> set[str]:
+    if field == "age":
+        return AGE_KEYS
+    if field == "sex":
+        return SEX_KEYS
+    return {field, user_text.lower()} if user_text else {field}
+
+
+def _sample_has_keys(sample: dict[str, Any], keys: set[str]) -> bool:
+    for row in sample.get("characteristics") or []:
+        if isinstance(row, dict) and str(row.get("key") or "").lower() in keys and str(row.get("value") or "").strip():
+            return True
+    return False
+
+
+def judgement_from_assessment(row: Any) -> CriterionJudgement:
+    from app.pipeline.repo import load
+
+    return CriterionJudgement(
+        criterion_id=row.criterion_id,
+        verdict=row.verdict,
+        reason=row.reason or "",
+        quote=row.quote or "",
+        quotes=load(getattr(row, "quotes_json", None), []),
+        evidence_ids=load(row.evidence_ids, []),
+        judge_source=row.judge_source or "",
+        support_text=getattr(row, "support_text", "") or "",
+        clue_only=bool(getattr(row, "clue_only", False)),
+        qualifying_gsms=load(getattr(row, "qualifying_gsms_json", None), []),
+    )
+
+
+def sample_record(sample: Any) -> dict[str, Any]:
+    from app.pipeline.repo import load
+
+    if isinstance(sample, dict):
+        return sample
+    attrs = load(getattr(sample, "attrs_json", None), {})
+    return {
+        "gsm": sample.gsm,
+        "title": sample.title,
+        "organism": sample.organism,
+        "source_name": sample.source_name,
+        "donor_key": sample.donor_key,
+        "group_label": getattr(sample, "group_label", None),
+        "library_strategy": sample.library_strategy,
+        "library_source": attrs.get("library_source") or "",
+        "protocol": attrs.get("protocol") or "",
+        "protocol_fields": attrs.get("protocol_fields") or {},
+        "characteristics": load(sample.characteristics_json, []),
+        "coverage_incomplete": sample.coverage_incomplete,
+    }
+
+
+def applicable_gsms(
+    spec: ResearchSpec,
+    judgements: list[CriterionJudgement],
+    samples: list[dict[str, Any]] | None,
+    study: dict[str, Any] | None = None,
+) -> list[str]:
+    """Final comparable cohort: groups that simultaneously meet applicable hard constraints."""
+    cohort = _comparison_cohort(spec, judgements, samples, study)
+    return sorted(cohort or [])
+
+
+def _comparison_cohort(
+    spec: ResearchSpec,
+    judgements: list[CriterionJudgement],
+    samples: list[dict[str, Any]] | None,
+    study: dict[str, Any] | None = None,
+) -> set[str] | None:
+    if not samples:
+        return None
+    hard = [c for c in spec.inclusion_criteria if c.priority == "hard"]
+    by_id = {j.criterion_id: j for j in judgements}
+    by_gsm = {str(s.get("gsm") or "").upper(): s for s in samples if s.get("gsm")}
+    group_claim: set[str] | None = None
+    constraint_sets: list[set[str]] = []
+    for criterion in hard:
+        item = by_id.get(criterion.criterion_id)
+        if not item or item.verdict != "pass":
+            continue
+        gsms = {str(g).upper() for g in item.qualifying_gsms if g}
+        if criterion.field in CASE_EVIDENCE_FIELDS:
+            continue
+        if criterion.field in COHORT_FIELDS:
+            if gsms:
+                group_claim = gsms if group_claim is None else group_claim | gsms
+            continue
+        if _cohort_constraint(criterion.field):
+            if not gsms and (criterion.field in {"age", "sex"} or criterion.field.startswith("meta_")):
+                keys = _clinical_keys(criterion.field.replace("meta_", ""), criterion.user_text)
+                gsms = {gsm for gsm, row in by_gsm.items() if _sample_has_keys(row, keys)}
+            if gsms:
+                constraint_sets.append(gsms)
+    if group_claim is None and not constraint_sets:
+        return None
+    common = set(group_claim) if group_claim is not None else set.intersection(*constraint_sets)
+    for extra in constraint_sets:
+        common &= extra
+    usable = {gsm for gsm in common if _sample_fits_all_hard(by_gsm.get(gsm), spec, study, judgements)}
+    return usable
+
+
 def _restrict_to_common_subset(
     spec: ResearchSpec,
     judgements: list[CriterionJudgement],
@@ -424,55 +635,94 @@ def _restrict_to_common_subset(
     study: dict[str, Any] | None = None,
 ) -> list[CriterionJudgement]:
     if not samples:
+        restricted = {c.criterion_id for c in spec.inclusion_criteria if c.priority == "hard" and c.field in {"sample_source", "tissue"}}
+        for item in judgements:
+            if item.criterion_id in restricted:
+                item.verdict = "unknown"
+                item.reason = "缺少样本级来源/组织证据。"
         return judgements
     hard = [c for c in spec.inclusion_criteria if c.priority == "hard"]
     by_id = {j.criterion_id: j for j in judgements}
-    claimed: list[set[str]] = []
+    by_sample = {str(s.get("gsm") or "").upper(): s for s in samples}
     for criterion in hard:
         item = by_id.get(criterion.criterion_id)
-        if not item or item.verdict != "pass":
+        if not item or item.verdict == "unknown" or criterion.field not in {"sample_source", "tissue"}:
             continue
-        gsms = {str(g).upper() for g in item.qualifying_gsms if g}
-        if gsms:
-            claimed.append(gsms)
-    if len(claimed) >= 2:
-        common = set.intersection(*claimed)
-        if not common:
-            for criterion in hard:
-                item = by_id.get(criterion.criterion_id)
-                if item and item.verdict == "pass":
-                    item.verdict = "unknown"
-                    item.reason = (item.reason or "") + " 各硬条件没有共同可用样本子集。"
-                    item.clue_only = True
-            return judgements
-        by_gsm = {str(s.get("gsm") or "").upper(): s for s in samples if s.get("gsm")}
-        usable = {gsm for gsm in common if _sample_fits_all_hard(by_gsm.get(gsm), spec, study)}
-        if not usable:
-            for criterion in hard:
-                item = by_id.get(criterion.criterion_id)
-                if item and item.verdict == "pass":
-                    item.verdict = "unknown"
-                    item.reason = (item.reason or "") + " 共同子集无法同时满足全部硬条件。"
-                    item.clue_only = True
-            return judgements
+        matches = lambda s, field=criterion.field: (
+            source_kind(s) == spec.sample_source if field == "sample_source" else tissue_matches(s, spec.tissues)
+        )
+        gsms = item.qualifying_gsms
+        if item.verdict == "fail" or not gsms or not all(g.upper() in by_sample and matches(by_sample[g.upper()]) for g in gsms):
+            item.verdict = "unknown"
+            item.clue_only = True
+            item.reason = "来源/组织硬条件需要同一 GSM 子集的明确样本字段；缺失、模型来源或混合研究不能整体判定。"
+    taxa = {str(s.get("organism") or "").casefold() for s in samples if s.get("organism")}
+    taxa.update(t.strip().casefold() for t in str((study or {}).get("taxon") or "").replace(";", ",").split(",") if t.strip())
+    assays = {infer_sample_assay(s, study).kind for s in samples}
+    mixed = len(taxa) > 1 or len(assays - {None}) > 1
+    if mixed:
         for criterion in hard:
             item = by_id.get(criterion.criterion_id)
-            if item and item.verdict == "pass" and item.qualifying_gsms:
-                item.qualifying_gsms = [g for g in item.qualifying_gsms if g.upper() in usable]
-                if not item.qualifying_gsms:
-                    item.verdict = "unknown"
-                    item.reason = (item.reason or "") + " 共同子集为空。"
-                    item.clue_only = True
-        groups_item = next((j for j in judgements if j.criterion_id in {"groups", "donors_per_group"} and j.verdict == "pass"), None)
-        if groups_item and spec.required_groups:
-            labels = {infer_group_label(by_gsm[g], spec=spec) for g in usable if g in by_gsm}
-            if not {x.lower() for x in spec.required_groups}.issubset({x for x in labels if x}):
-                groups_item.verdict = "unknown"
-                groups_item.reason = (groups_item.reason or "") + " 共同子集未覆盖全部要求分组。"
+            if item and item.verdict == "pass" and not item.qualifying_gsms:
+                item.verdict = "unknown"
+                item.clue_only = True
+                item.reason = "混合研究必须明确各硬条件适用的 GSM 子集，不能整体通过。"
+    claimed = any(
+        j.verdict == "pass" and j.qualifying_gsms
+        for j in judgements
+        if _criterion_map(spec).get(j.criterion_id) and _criterion_map(spec)[j.criterion_id].priority == "hard"
+    )
+    if not claimed:
+        return judgements
+    usable = _comparison_cohort(spec, judgements, samples, study)
+    if usable is None:
+        return judgements
+    if not usable:
+        for criterion in hard:
+            item = by_id.get(criterion.criterion_id)
+            if item and item.verdict == "pass":
+                item.verdict = "unknown"
+                item.reason = (item.reason or "") + " 共同子集无法同时满足全部硬条件。"
+                item.clue_only = True
+        return judgements
+    by_gsm = {str(s.get("gsm") or "").upper(): s for s in samples if s.get("gsm")}
+    for criterion in hard:
+        item = by_id.get(criterion.criterion_id)
+        if not item or item.verdict != "pass" or not item.qualifying_gsms:
+            continue
+        if criterion.field in CASE_EVIDENCE_FIELDS:
+            item.qualifying_gsms = [g for g in item.qualifying_gsms if g.upper() in usable]
+            continue
+        if criterion.field in COHORT_FIELDS or _cohort_constraint(criterion.field):
+            item.qualifying_gsms = [g for g in item.qualifying_gsms if g.upper() in usable]
+            if not item.qualifying_gsms:
+                item.verdict = "unknown"
+                item.reason = (item.reason or "") + " 共同子集为空。"
+                item.clue_only = True
+    groups_item = next((j for j in judgements if j.criterion_id in {"groups", "donors_per_group"} and j.verdict == "pass"), None)
+    if groups_item and spec.required_groups:
+        labels = {infer_group_label(by_gsm[g], spec=spec) for g in usable if g in by_gsm}
+        if not {x.lower() for x in spec.required_groups}.issubset({x for x in labels if x}):
+            groups_item.verdict = "unknown"
+            groups_item.reason = (groups_item.reason or "") + " 共同子集未覆盖全部要求分组。"
+    donor_item = by_id.get("donors_per_group")
+    if donor_item and donor_item.verdict == "pass" and spec.minimum_donors_per_group:
+        cohort_samples = [by_gsm[g] for g in usable if g in by_gsm]
+        stats = donors_per_group(cohort_samples, spec.required_groups, spec=spec)
+        need = int(spec.minimum_donors_per_group)
+        if any(int(stats.get("counts", {}).get(g, 0) or 0) < need for g in spec.required_groups):
+            donor_item.verdict = "unknown"
+            donor_item.reason = (donor_item.reason or "") + " 过滤后独立供体未达到每组门槛。"
+            donor_item.clue_only = True
     return judgements
 
 
-def _sample_fits_all_hard(sample: dict[str, Any] | None, spec: ResearchSpec, study: dict[str, Any] | None) -> bool:
+def _sample_fits_all_hard(
+    sample: dict[str, Any] | None,
+    spec: ResearchSpec,
+    study: dict[str, Any] | None,
+    judgements: list[CriterionJudgement] | None = None,
+) -> bool:
     if not sample:
         return False
     if spec.organisms and _organism_ok(sample, spec.organisms) is not True:
@@ -481,6 +731,29 @@ def _sample_fits_all_hard(sample: dict[str, Any] | None, spec: ResearchSpec, stu
         call = infer_sample_assay(sample, study)
         if assay_relation(list(spec.assay_types), call) != "ok":
             return False
+    if spec.assay_methods:
+        if sample_method_relation(list(spec.assay_methods), sample) != "ok":
+            return False
+    if spec.sample_source != "any" and source_kind(sample) != spec.sample_source:
+        return False
+    if spec.tissue_required and spec.tissues and not tissue_matches(sample, spec.tissues):
+        return False
+    by_id = {j.criterion_id: j for j in (judgements or [])}
+    gsm = str(sample.get("gsm") or "").upper()
+    for criterion in spec.inclusion_criteria:
+        if criterion.priority != "hard":
+            continue
+        field = criterion.field
+        if not _cohort_constraint(field):
+            continue
+        item = by_id.get(criterion.criterion_id)
+        listed = {str(g).upper() for g in (item.qualifying_gsms if item else []) if g}
+        if listed and gsm not in listed:
+            return False
+        if field in {"age", "sex"} or field.startswith("meta_"):
+            keys = _clinical_keys(field.replace("meta_", ""), criterion.user_text)
+            if not _sample_has_keys(sample, keys):
+                return False
     return True
 
 
@@ -592,7 +865,8 @@ def merge_final(
             CriterionJudgement(
                 criterion_id=criterion.criterion_id,
                 verdict="unknown",
-                reason="模型未完成有效核验；不继承弱关键词规则的 pass。"
+                reason=("证据仍不足：" + "；".join(j.reason for j in (f_item, v_item) if j and j.reason)
+                        if first_ok and verify_ok else "模型核验未完成或输出无效。")
                 + ((" 规则说明：" + rule.reason) if rule.reason else ""),
                 judge_source="rule",
                 clue_only=True,
@@ -600,6 +874,8 @@ def merge_final(
             )
         )
     merged = _restrict_to_common_subset(spec, merged, samples, study=study)
+    for item in merged:
+        _guard_subset_failure(item, spec, samples, study)
     return merged, conflicts, review_complete, model_invalid
 
 
@@ -613,7 +889,7 @@ def _rule_standalone(rule: CriterionJudgement) -> bool:
     field_hint = rule.criterion_id.split("_")[0]
     if rule.criterion_id in DETERMINISTIC_FIELDS or field_hint in DETERMINISTIC_FIELDS:
         return True
-    if rule.criterion_id in {"organism", "donors_per_group", "assay"}:
+    if rule.criterion_id in {"organism", "donors_per_group", "assay", "assay_method"}:
         return True
     return rule.verdict == "fail"
 

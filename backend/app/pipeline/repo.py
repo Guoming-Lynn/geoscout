@@ -2,12 +2,28 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Dataset, Event, Job, QueryAttempt, Run, RunDataset, Sample, utcnow
+from app.db.models import (
+    Assessment,
+    Dataset,
+    Event,
+    Evidence,
+    Export,
+    Job,
+    Override,
+    Project,
+    QueryAttempt,
+    Run,
+    RunDataset,
+    RunEvidence,
+    Sample,
+    utcnow,
+)
 from app.evidence.store import new_id
 from app.pipeline.donors import infer_group_label
 
@@ -158,3 +174,33 @@ async def upsert_sample(
     existing.attrs_json = dump(sample)
     existing.coverage_incomplete = truncated
     return existing
+
+
+async def clear_workspace(session: AsyncSession) -> dict[str, int]:
+    """Delete projects, runs, and export files. Keep GEO dataset cache."""
+    export_paths = (await session.execute(select(Export.path))).scalars().all()
+    deleted: dict[str, int] = {}
+    for model in (
+        Job,
+        Event,
+        Override,
+        Assessment,
+        RunEvidence,
+        Evidence,
+        RunDataset,
+        QueryAttempt,
+        Export,
+        Run,
+        Project,
+    ):
+        result = await session.execute(delete(model))
+        deleted[model.__tablename__] = int(result.rowcount or 0)
+    for raw in export_paths:
+        path = Path(str(raw))
+        try:
+            path.unlink(missing_ok=True)
+            audit = path.with_suffix(".audit.json")
+            audit.unlink(missing_ok=True)
+        except OSError:
+            continue
+    return deleted

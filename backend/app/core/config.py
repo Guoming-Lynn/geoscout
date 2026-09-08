@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     data_dir: Path = Path("./data")
+    embed_worker: bool = False
+    serve_web: bool = False
+    open_browser: bool = True
     ncbi_tool: str = "GEOScout"
     ncbi_email: str = ""
     ncbi_api_key: str = ""

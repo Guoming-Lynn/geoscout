@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from app.pipeline.assay import METHOD_SYNONYMS
 from app.pipeline.lexicon import ASSAY_GTYP, ASSAY_SUPPLEMENTAL, lexicon_terms
 from app.schemas.spec import PlannedQuery, ResearchSpec, TermEntry
 
@@ -32,16 +33,42 @@ def and_join(parts: list[str]) -> str:
     return " AND ".join(p for p in parts if p)
 
 
+def _method_terms(spec: ResearchSpec) -> list[TermEntry]:
+    out: list[TermEntry] = []
+    seen: set[str] = set()
+    for method in spec.assay_methods or []:
+        for term in METHOD_SYNONYMS.get(method, [method]):
+            low = term.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            out.append(TermEntry(term=term, group="assay", origin="user" if term == method else "lexicon"))
+    return out
+
+
 def collect_terms(spec: ResearchSpec, extra: list[TermEntry] | None = None) -> list[TermEntry]:
     terms: list[TermEntry] = []
     terms.extend(lexicon_terms("disease", spec.disease))
     terms.extend(lexicon_terms("tissue", spec.tissues))
-    assay_keys = spec.assay_types or []
-    terms.extend(lexicon_terms("assay", assay_keys))
+    if spec.assay_methods:
+        terms.extend(_method_terms(spec))
+    else:
+        terms.extend(lexicon_terms("assay", spec.assay_types or []))
     terms.extend(lexicon_terms("organism", spec.organisms))
     if extra:
         seen = {(t.group, t.term.lower()) for t in terms}
         for item in extra:
+            seeds = {"disease": spec.disease, "tissue": spec.tissues,
+                     "assay": spec.assay_types, "organism": spec.organisms}.get(item.group, [])
+            if item.group == "assay" and spec.assay_methods:
+                allowed = " ".join(spec.assay_methods).casefold()
+                if not any(part.casefold() in item.term.casefold() or item.term.casefold() in part.casefold()
+                           for part in spec.assay_methods):
+                    continue
+                if "chip" in item.term.casefold() and "atac" in allowed and "chip" not in allowed:
+                    continue
+            if not seeds or re.fullmatch(r"[A-Z0-9-]{1,4}", item.term.strip()):
+                continue
             key = (item.group, item.term.lower())
             if key not in seen:
                 terms.append(item)
@@ -68,7 +95,9 @@ def plan_queries(
     organism_filters = [_organism_filter(name) for name in spec.organisms]
     assay_gtyp = None
     if spec.assay_types:
-        assay_gtyp = f'"{ASSAY_GTYP[spec.assay_types[0]]}"[GTYP]'
+        gtyp = ASSAY_GTYP.get(spec.assay_types[0])
+        if gtyp:
+            assay_gtyp = f'"{gtyp}"[GTYP]'
 
     planned: list[PlannedQuery] = []
     seen: set[str] = set()
@@ -84,6 +113,11 @@ def plan_queries(
     assay = or_group(grouped["assay"][:6])
     tissue = or_group(grouped["tissue"][:6])
     gse = '"gse"[ETYP]'
+    method_q = or_group([item.term for item in _method_terms(spec)][:6]) if spec.assay_methods else ""
+
+    # The first query preserves the user's concepts before model expansion.
+    add(and_join([or_group(spec.disease), or_group(spec.tissues), *organism_filters, method_q, assay_gtyp, gse]),
+        1, "user", ["disease", "tissue", "organism", "assay"])
 
     round1 = and_join([disease, tissue, assay, *organism_filters, assay_gtyp, gse])
     add(round1, 1, "planner", [g for g in ["disease", "tissue", "assay", "organism"] if (g == "organism") or grouped.get(g) or (g == "tissue" and tissue)])
@@ -94,14 +128,16 @@ def plan_queries(
     if grouped["disease"]:
         add(and_join([or_group(grouped["disease"]), *organism_filters, gse]), 2, "planner", ["disease", "organism"])
 
-    if spec.assay_types:
-        for extra_term in ASSAY_SUPPLEMENTAL.get(spec.assay_types[0], []):
-            add(
-                and_join([disease, f'"{extra_term}"', *organism_filters, gse]),
-                2,
-                "planner",
-                ["disease", "assay_supplement"],
-            )
+    extras = list(spec.assay_methods) if spec.assay_methods else (
+        ASSAY_SUPPLEMENTAL.get(spec.assay_types[0], []) if spec.assay_types else []
+    )
+    for extra_term in extras:
+        add(
+            and_join([disease, f'"{extra_term}"', *organism_filters, gse]),
+            2,
+            "planner",
+            ["disease", "assay_supplement"],
+        )
 
     return planned
 
@@ -128,7 +164,7 @@ def _tokens(text: str) -> list[str]:
 
 def _term_relevant(term: str, spec: ResearchSpec) -> bool:
     blob = " ".join(
-        spec.disease + spec.tissues + spec.organisms + spec.assay_types + spec.original_request.split()
+        spec.disease + spec.tissues + spec.organisms + spec.assay_types + spec.assay_methods + spec.original_request.split()
     ).lower()
     t = term.lower()
     if len(t) < 4:

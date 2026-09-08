@@ -17,6 +17,7 @@ from app.connectors.llm import LLMError, LLMProvider
 from app.connectors.ncbi import NCBIClient, NCBIError, gse_from_summary, public_summary
 from app.core.config import settings
 from app.core.credentials import SessionCredentials, store
+from app.core.usage import add_usage
 from app.core.urls import accession_page
 from app.db.models import Assessment, Dataset, DatasetRelation, Job, QueryAttempt, Run, RunDataset, Sample
 from app.evidence.soft_parser import count_independent_donors, parse_soft_bytes, series_as_dict
@@ -29,9 +30,10 @@ from app.pipeline.assessment import (
     judge_user_payload,
     merge_final,
 )
-from app.pipeline.budget import BudgetStop, check_before_external, estimate_tokens
-from app.pipeline.donors import donors_per_group
+from app.pipeline.budget import BudgetStop, check_before_external, estimate_tokens, review_token_reserve
+from app.pipeline.donors import donors_per_group, infer_group_label
 from app.pipeline.query_planner import plan_queries
+from app.pipeline.ranking import relevance, select_deep_targets
 from app.pipeline.repo import (
     add_event,
     bump_counters,
@@ -49,7 +51,7 @@ from app.schemas.spec import Budget, CriterionJudgement, ResearchSpec, TermEntry
 
 logger = logging.getLogger("geoscout.engine")
 
-LLM_DATASET_STATUSES = {"soft_loaded", "soft_incomplete", "verified", "needs_review"}
+LLM_DATASET_STATUSES = {"soft_loaded", "soft_incomplete", "assessed", "verified", "needs_review"}
 TERMINAL = {"completed", "partial", "failed", "cancelled"}
 
 
@@ -165,10 +167,22 @@ class Engine:
         mock = settings.llm_mode == "mock" or self._demo(run)
         if not mock and not creds.has_llm_key():
             raise WaitingForCredentials()
-        return LLMProvider(creds, mock=mock)
+        return LLMProvider(creds, mock=mock, on_usage=lambda usage: _add_tokens(run, usage),
+                           before_request=lambda body: self._guard_llm_request(run, body))
 
-    def _guard(self, run: Run, next_action: str) -> None:
-        check_before_external(run, self._budget(run), next_action=next_action)
+    def _guard_llm_request(self, run: Run, body: dict) -> None:
+        self._guard(run, "llm")
+        usage = load(run.token_usage_json, {})
+        used = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
+        expected = estimate_tokens(json.dumps(body.get("messages", []), ensure_ascii=False)) + int(body.get("max_tokens") or 0)
+        if used + expected > self._budget(run).max_tokens:
+            raise BudgetStop("剩余 token 预算不足以容纳下一次请求（预估输入及输出额度）", unfinished="llm")
+
+    def _guard(self, run: Run, next_action: str, *, reserve: int = 0) -> None:
+        check_before_external(run, self._budget(run), next_action=next_action, reserve=reserve)
+
+    def _guard_review(self, run: Run, phase: str, *, input_tokens: int = 0) -> None:
+        self._guard(run, "llm", reserve=review_token_reserve(self._budget(run), phase=phase, input_tokens=input_tokens))
 
     async def step_plan(self, run: Run) -> None:
         run.status = "running"
@@ -196,7 +210,6 @@ class Engine:
                     schema=None,
                     max_output_tokens=self._budget(run).max_completion_tokens,
                 )
-                _add_tokens(run, usage, estimate_chars=len(spec.model_dump_json()))
                 for item in payload.get("terms") or []:
                     extra.append(TermEntry.model_validate(item))
             except WaitingForCredentials:
@@ -208,7 +221,7 @@ class Engine:
         planned = plan_queries(spec, extra, manual_query=manual)
         budget = self._budget(run)
         planned = planned[: budget.max_queries]
-        for item in planned:
+        for query_index, item in enumerate(planned):
             self.session.add(
                 QueryAttempt(
                     id=new_id(),
@@ -216,6 +229,7 @@ class Engine:
                     query_hash=_qhash(item.term),
                     term=item.term,
                     round_no=item.round_no,
+                    query_index=query_index,
                     source=item.source,
                     status="pending",
                 )
@@ -233,7 +247,7 @@ class Engine:
             await self.session.execute(
                 select(QueryAttempt)
                 .where(QueryAttempt.run_id == run.id, QueryAttempt.status == "pending")
-                .order_by(QueryAttempt.round_no, QueryAttempt.id)
+                .order_by(QueryAttempt.query_index, QueryAttempt.id)
             )
         ).scalars().all()
         if not pending:
@@ -252,29 +266,35 @@ class Engine:
             return
         self._guard(run, "search")
         attempt = pending[0]
+        # Reserve a share for every pending query. Unused capacity rolls forward.
+        attempt.candidate_limit = attempt.candidate_limit or max(1, (budget.max_unique_gse - unique) // len(pending))
+        allowance = min(attempt.candidate_limit, budget.max_unique_gse - unique)
         client = self._ncbi(run)
         attempt.status = "running"
         attempt.started_at = datetime.now(timezone.utc)
+        checkpoint = load(run.checkpoint_json, {})
+        seen_uids = set(checkpoint.get("search_seen_uids", []))
         try:
             page_size = budget.esearch_page_size
             retstart = attempt.retstart
-            first = await client.esearch(attempt.term, retstart=retstart, retmax=page_size)
+            first = await client.esearch(attempt.term, retstart=retstart, retmax=min(page_size, allowance))
             attempt.hit_count = first["count"]
             attempt.query_translation = first["querytranslation"]
-            ids = list(first["idlist"])
-            retstart += len(ids)
-            fetch_cap = min(first["count"], budget.max_unique_gse)
-            while retstart < fetch_cap and len(ids) < budget.max_unique_gse:
+            ids = [uid for uid in dict.fromkeys(first["idlist"]) if uid not in seen_uids][:allowance]
+            retstart += len(first["idlist"])
+            fetch_cap = min(first["count"], budget.max_unique_gse + len(seen_uids))
+            while retstart < fetch_cap and len(ids) < allowance:
                 self._guard(run, "search")
-                more = await client.esearch(attempt.term, retstart=retstart, retmax=page_size)
+                more = await client.esearch(attempt.term, retstart=retstart, retmax=min(page_size, allowance - len(ids)))
                 if not more["idlist"]:
                     break
-                ids.extend(more["idlist"])
+                batch_ids = [uid for uid in dict.fromkeys(more["idlist"]) if uid not in seen_uids and uid not in ids][:allowance - len(ids)]
+                ids.extend(batch_ids)
                 retstart += len(more["idlist"])
                 attempt.pages_done += 1
             attempt.retstart = retstart
             attempt.pages_done = max(attempt.pages_done, 1)
-            attempt.truncated = int(first["count"] or 0) > len(ids)
+            attempt.truncated = int(first["count"] or 0) > retstart
             if attempt.truncated:
                 run.stop_reason = run.stop_reason or "ESearch 命中超过本次取回上限，查询已截断"
             ck = load(self.job.checkpoint_json, {})
@@ -282,9 +302,11 @@ class Engine:
             ck["term"] = attempt.term
             ck["truncated"] = attempt.truncated
             self.job.checkpoint_json = dump(ck)
+            checkpoint["search_seen_uids"] = sorted(seen_uids | set(ids))
+            run.checkpoint_json = dump(checkpoint)
             write_snapshot(run.id, f"esearch_{attempt.query_hash}.json", first | {"idlist": ids, "truncated": attempt.truncated})
         except NCBIError:
-            attempt.status = "error"
+            attempt.status = "pending"
             attempt.error_message = "search failed"
             attempt.finished_at = datetime.now(timezone.utc)
             raise
@@ -398,10 +420,15 @@ class Engine:
             ds = await self.session.get(Dataset, rd.gse)
             summary = _screen_summary(ds)
             judgements = bind_rule_evidence(rule_judgements(spec, summary, []), await evidence_bundle(self.session, run.id, rd.gse))
-            rd.first_assess_json = dump({"rules": [j.model_dump() for j in judgements]})
+            rule_data = [j.model_dump() for j in judgements]
+            rd.first_assess_json = dump({"rules": rule_data, "selection": relevance(spec, summary, rule_data)})
             score, coverage, _ = soft_score(spec, judgements)
             rd.soft_score = score
             rd.soft_coverage = coverage
+            unknown = [c.criterion_id for c in spec.inclusion_criteria if c.priority == "hard"
+                       and not any(j.criterion_id == c.criterion_id and j.verdict in {"pass", "fail"}
+                                   and not j.clue_only for j in judgements)]
+            rd.hard_unknowns = len(unknown)
             rd.gsm_count = summary.get("n_samples")
             rd.processed_data = "probable" if summary.get("suppfile") else "unknown"
             hard_fail = any(
@@ -421,7 +448,7 @@ class Engine:
             else:
                 rd.category = "needs_review"
                 rd.verification_status = "summary_screened"
-                rd.reason = "初筛完成，深度核验待进行。"
+                rd.reason = "初筛完成，未做深度核验。" + ("待核实条件: " + ", ".join(unknown) if unknown else "摘要线索不能替代样本核验。")
             await _replace_assessments(self.session, run.id, rd.gse, "rule_screen", judgements, actor="rule")
         await add_event(self.session, run.id, f"规则初筛完成，{len(rows)} 条 GSE")
         self.job.status = "done"
@@ -435,12 +462,25 @@ class Engine:
         budget = self._budget(run)
         spec = self._spec(run)
         rows = (await self.session.execute(select(RunDataset).where(RunDataset.run_id == run.id))).scalars().all()
-        ranked = sorted(rows, key=lambda r: _deep_priority(spec, r), reverse=True)
-        targets = [r for r in ranked if r.verification_status != "rule_excluded"][: budget.max_deep_verify]
+        checkpoint = load(run.checkpoint_json, {})
+        if "deep_targets" not in checkpoint:
+            datasets = (await self.session.execute(select(Dataset).join(RunDataset, RunDataset.gse == Dataset.gse).where(RunDataset.run_id == run.id))).scalars().all()
+            summaries = {d.gse: _screen_summary(d) for d in datasets}
+            checkpoint["deep_targets"] = select_deep_targets(rows, summaries, budget.max_deep_verify)
+            for row in rows:
+                first = load(row.first_assess_json, {})
+                selection = first.setdefault("selection", {})
+                selection["selected"] = row.gse in checkpoint["deep_targets"]
+                selection["rank"] = checkpoint["deep_targets"].index(row.gse) + 1 if selection["selected"] else None
+                first["selection"] = selection
+                row.first_assess_json = dump(first)
+            run.checkpoint_json = dump(checkpoint)
+        by_gse = {r.gse: r for r in rows}
+        targets = [by_gse[g] for g in checkpoint["deep_targets"] if g in by_gse]
         payload = load(self.job.payload_json, {})
         index = int(payload.get("index") or 0)
         if index >= len(targets):
-            skipped = max(0, len(ranked) - len(targets))
+            skipped = max(0, len(rows) - len(targets))
             await bump_counters(self.session, run, deep_skipped=skipped)
             self.job.status = "done"
             await enqueue_job(self.session, run.id, "assess")
@@ -519,20 +559,22 @@ class Engine:
     async def step_assess(self, run: Run) -> None:
         run.stage = "verifying"
         spec = self._spec(run)
-        payload = load(self.job.payload_json, {})
-        rows = _llm_targets((await self.session.execute(select(RunDataset).where(RunDataset.run_id == run.id))).scalars().all())
-        index = int(payload.get("index") or 0)
-        if index >= len(rows):
+        rows = _review_queue(run, (await self.session.execute(select(RunDataset).where(RunDataset.run_id == run.id))).scalars().all())
+        opened = _open_review(rows)
+        if opened is None:
             self.job.status = "done"
-            await enqueue_job(self.session, run.id, "verify")
+            await enqueue_job(self.session, run.id, "finalize")
             return
-        self._guard(run, "llm")
-        rd = rows[index]
-        sample_dicts = await _sample_dicts(self.session, rd.gse)
+        index, phase, rd = opened
+        if phase != "assess":
+            self.job.status = "done"
+            await enqueue_job(self.session, run.id, phase, {"index": index})
+            return
+        sample_dicts = await _sample_dicts(self.session, rd.gse, spec=spec)
         ds = await self.session.get(Dataset, rd.gse)
         summary = load(ds.summary_json, {}) if ds else {}
         evidence = await evidence_bundle(self.session, run.id, rd.gse)
-        _, coverage = fit_samples(sample_dicts, evidence=evidence)
+        _, coverage = fit_samples(sample_dicts, evidence=evidence, spec=spec)
         truncated = any(s.get("coverage_incomplete") for s in sample_dicts) or not coverage.get("complete", True)
         rules = bind_rule_evidence(rule_judgements(spec, summary, sample_dicts, truncated=truncated), evidence)
         checked: CheckedAssessment | None = None
@@ -558,74 +600,91 @@ class Engine:
             raise
         except LLMError as exc:
             rd.model_output_invalid = True
+            rd.concerns = f"模型请求失败（{exc.kind}）：{exc}"
             await add_event(self.session, run.id, f"{rd.gse} 首次模型核验无效: {exc}", level="warn")
         if await self._abandon_if_finished(run):
             return
         rd.first_assess_json = dump(
             {
+                "selection": load(rd.first_assess_json, {}).get("selection", {}),
                 "rules": [j.model_dump() for j in rules],
                 "model": [j.model_dump() for j in checked.judgements] if checked else None,
                 "model_invalid": bool(checked.invalid) if checked else rd.model_output_invalid,
                 "model_incomplete": bool(checked.incomplete) if checked else True,
             }
         )
+        if rd.verification_status == "soft_loaded":
+            rd.verification_status = "assessed"
         await _replace_assessments(self.session, run.id, rd.gse, "assess_rules", rules, actor="rule")
         if checked:
             await _replace_assessments(self.session, run.id, rd.gse, "assess_model", checked.judgements, actor="model")
         self.job.status = "done"
-        await enqueue_job(self.session, run.id, "assess", {"index": index + 1})
+        await enqueue_job(self.session, run.id, "verify", {"index": index})
 
     async def step_verify(self, run: Run) -> None:
         run.stage = "verifying"
         spec = self._spec(run)
-        payload = load(self.job.payload_json, {})
-        rows = _llm_targets((await self.session.execute(select(RunDataset).where(RunDataset.run_id == run.id))).scalars().all())
-        index = int(payload.get("index") or 0)
-        if index >= len(rows):
+        rows = _review_queue(run, (await self.session.execute(select(RunDataset).where(RunDataset.run_id == run.id))).scalars().all())
+        opened = _open_review(rows)
+        if opened is None:
             self.job.status = "done"
             await enqueue_job(self.session, run.id, "finalize")
             return
-        self._guard(run, "llm")
-        rd = rows[index]
+        index, phase, rd = opened
+        if phase != "verify":
+            self.job.status = "done"
+            await enqueue_job(self.session, run.id, phase, {"index": index})
+            return
+        skip_llm = "model" in load(rd.verify_assess_json, {})
         evidence = await evidence_bundle(self.session, run.id, rd.gse)
-        sample_dicts = await _sample_dicts(self.session, rd.gse)
+        sample_dicts = await _sample_dicts(self.session, rd.gse, spec=spec)
         ds = await self.session.get(Dataset, rd.gse)
         summary = load(ds.summary_json, {}) if ds else {}
-        _, coverage = fit_samples(sample_dicts, evidence=evidence)
+        _, coverage = fit_samples(sample_dicts, evidence=evidence, spec=spec)
         truncated = any(s.get("coverage_incomplete") for s in sample_dicts) or not coverage.get("complete", True)
         verify_checked: CheckedAssessment | None = None
-        try:
-            if await self._abandon_if_finished(run):
-                return
-            verify_checked = await self._complete_assessment(
-                run,
-                prompt_name="verify_dataset",
-                spec=spec,
-                rd=rd,
-                summary=summary,
-                evidence=evidence,
-                sample_dicts=sample_dicts,
-                coverage=coverage,
+        stored = load(rd.verify_assess_json, {})
+        if skip_llm and stored.get("model") is not None:
+            verify_checked = CheckedAssessment(
+                judgements=[CriterionJudgement.model_validate(x) for x in stored["model"]],
+                invalid=bool(stored.get("invalid")),
+                incomplete=bool(stored.get("incomplete")),
             )
-            if verify_checked.invalid:
+        else:
+            try:
+                if await self._abandon_if_finished(run):
+                    return
+                verify_checked = await self._complete_assessment(
+                    run,
+                    prompt_name="verify_dataset",
+                    spec=spec,
+                    rd=rd,
+                    summary=summary,
+                    evidence=evidence,
+                    sample_dicts=sample_dicts,
+                    coverage=coverage,
+                )
+                if verify_checked.invalid:
+                    rd.model_output_invalid = True
+                    await add_event(self.session, run.id, f"{rd.gse} 复核模型无效: {verify_checked.error}", level="warn")
+                elif verify_checked.incomplete:
+                    await add_event(self.session, run.id, f"{rd.gse} 复核漏答: {verify_checked.error}", level="warn")
+            except WaitingForCredentials:
+                raise
+            except LLMError as exc:
                 rd.model_output_invalid = True
-                await add_event(self.session, run.id, f"{rd.gse} 复核模型无效: {verify_checked.error}", level="warn")
-            elif verify_checked.incomplete:
-                await add_event(self.session, run.id, f"{rd.gse} 复核漏答: {verify_checked.error}", level="warn")
-        except WaitingForCredentials:
-            raise
-        except LLMError as exc:
-            rd.model_output_invalid = True
-            await add_event(self.session, run.id, f"{rd.gse} 复核模型无效: {exc}", level="warn")
+                rd.concerns = f"模型请求失败（{exc.kind}）：{exc}"
+                await add_event(self.session, run.id, f"{rd.gse} 复核模型无效: {exc}", level="warn")
         if await self._abandon_if_finished(run):
             return
-        rd.verify_assess_json = dump(
-            {
-                "model": [j.model_dump() for j in verify_checked.judgements] if verify_checked else None,
-                "invalid": bool(verify_checked.invalid) if verify_checked else True,
-                "incomplete": bool(verify_checked.incomplete) if verify_checked else True,
-            }
-        )
+        if not skip_llm:
+            rd.verify_assess_json = dump(
+                {
+                    "model": [j.model_dump() for j in verify_checked.judgements] if verify_checked else None,
+                    "invalid": bool(verify_checked.invalid) if verify_checked else True,
+                    "incomplete": bool(verify_checked.incomplete) if verify_checked else True,
+                }
+            )
         if verify_checked:
             await _replace_assessments(self.session, run.id, rd.gse, "verify_model", verify_checked.judgements, actor="model")
         rules = bind_rule_evidence(rule_judgements(spec, summary, sample_dicts, truncated=truncated), evidence)
@@ -642,7 +701,7 @@ class Engine:
         )
         rd.model_output_invalid = rd.model_output_invalid or merge_invalid
         rd.conflict_json = dump(conflicts)
-        depth_complete = rd.verification_status == "soft_loaded" and coverage.get("complete", True)
+        depth_complete = rd.verification_status in {"soft_loaded", "assessed"} and coverage.get("complete", True)
         verified = depth_complete and review_complete and not conflicts and not rd.model_output_invalid
         rd.category, rd.reason = classify(
             spec,
@@ -654,14 +713,20 @@ class Engine:
             review_complete=review_complete,
         )
         score, coverage_score, _ = soft_score(spec, merged)
+        if rd.category == "needs_review" and rd.concerns and rd.concerns.startswith("模型请求失败"):
+            rd.reason = rd.concerns
         rd.soft_score = score
         rd.soft_coverage = coverage_score
         rd.hard_unknowns = sum(1 for j in merged if j.verdict == "unknown" and _is_hard(spec, j.criterion_id))
-        if rd.verification_status.startswith("soft"):
+        if rd.verification_status in {"soft_loaded", "soft_incomplete", "assessed"}:
             rd.verification_status = "verified" if verified else "needs_review"
         await _replace_assessments(self.session, run.id, rd.gse, "final", merged, actor="merge")
         self.job.status = "done"
-        await enqueue_job(self.session, run.id, "verify", {"index": index + 1})
+        nxt = _open_review(rows)
+        if nxt is None:
+            await enqueue_job(self.session, run.id, "finalize")
+        else:
+            await enqueue_job(self.session, run.id, nxt[1], {"index": nxt[0]})
 
     async def _complete_assessment(
         self,
@@ -680,14 +745,15 @@ class Engine:
             judge_user_payload(spec, rd.gse, summary=summary, evidence=evidence, samples=sample_dicts),
             ensure_ascii=False,
         )
+        system = load_prompt(prompt_name)
+        self._guard_review(run, prompt_name, input_tokens=estimate_tokens(system) + estimate_tokens(user))
         raw, usage = await llm.complete_json(
             prompt_name=prompt_name,
-            system=load_prompt(prompt_name),
+            system=system,
             user=user,
             schema=None,
             max_output_tokens=self._budget(run).max_completion_tokens,
         )
-        _add_tokens(run, usage, estimate_chars=len(user))
         checked = check_model_assessment(
             spec, raw, evidence, samples=sample_dicts, study=summary, sample_coverage=coverage
         )
@@ -753,7 +819,6 @@ class Engine:
                 schema=None,
                 max_output_tokens=min(self._budget(run).max_completion_tokens, 2048),
             )
-            _add_tokens(run, usage2, estimate_chars=len(repair_user))
             repaired = check_model_assessment(
                 spec, raw2, evidence, samples=sample_dicts, study=summary, sample_coverage=coverage
             )
@@ -871,13 +936,9 @@ def _add_tokens(run: Run, usage: dict[str, Any], *, estimate_chars: int = 0) -> 
         prompt = estimate_tokens("x" * estimate_chars) if estimate_chars else 32
         cur["estimated"] = True
     if completion is None:
-        completion = 0
+        completion = 32
         cur["estimated"] = True
-    cur["prompt_tokens"] = int(cur.get("prompt_tokens") or 0) + int(prompt)
-    cur["completion_tokens"] = int(cur.get("completion_tokens") or 0) + int(completion)
-    if usage.get("estimated"):
-        cur["estimated"] = True
-    run.token_usage_json = dump(cur)
+    run.token_usage_json = dump(add_usage(cur, {**usage, "prompt_tokens": prompt, "completion_tokens": completion}))
 
 
 def _llm_targets(rows: list[RunDataset]) -> list[RunDataset]:
@@ -885,18 +946,25 @@ def _llm_targets(rows: list[RunDataset]) -> list[RunDataset]:
     return [r for r in rows if r.verification_status in LLM_DATASET_STATUSES]
 
 
+def _review_queue(run: Run, rows: list[RunDataset]) -> list[RunDataset]:
+    by_gse = {r.gse: r for r in _llm_targets(rows)}
+    targets = load(run.checkpoint_json, {}).get("deep_targets") or []
+    ordered = [by_gse[g] for g in targets if g in by_gse]
+    seen = {r.gse for r in ordered}
+    return ordered + [r for r in _llm_targets(rows) if r.gse not in seen]
+
+
+def _open_review(rows: list[RunDataset]) -> tuple[int, str, RunDataset] | None:
+    for index, rd in enumerate(rows):
+        if "model" not in load(rd.first_assess_json, {}):
+            return index, "assess", rd
+        if rd.verification_status not in {"verified", "needs_review"}:
+            return index, "verify", rd
+    return None
+
+
 def _is_hard(spec: ResearchSpec, criterion_id: str) -> bool:
     return any(c.criterion_id == criterion_id and c.priority == "hard" for c in spec.inclusion_criteria)
-
-
-def _deep_priority(spec: ResearchSpec, rd: RunDataset) -> float:
-    first = load(rd.first_assess_json, {})
-    rules = first.get("rules") or []
-    unknown = sum(1 for j in rules if j.get("verdict") == "unknown" and _is_hard(spec, j.get("criterion_id", "")))
-    fail = any(j.get("verdict") == "fail" and _is_hard(spec, j.get("criterion_id", "")) for j in rules)
-    if fail:
-        return -1
-    return 10 + unknown
 
 
 def _soft_fixture(gse: str) -> Path:
@@ -907,7 +975,7 @@ def _soft_fixture(gse: str) -> Path:
     return root / "GSE1000_metadata.soft"
 
 
-async def _sample_dicts(session: AsyncSession, gse: str) -> list[dict[str, Any]]:
+async def _sample_dicts(session: AsyncSession, gse: str, *, spec: ResearchSpec | None = None) -> list[dict[str, Any]]:
     samples = (await session.execute(select(Sample).where(Sample.gse == gse))).scalars().all()
     out: list[dict[str, Any]] = []
     for s in samples:
@@ -920,12 +988,17 @@ async def _sample_dicts(session: AsyncSession, gse: str) -> list[dict[str, Any]]
                 "source_name": s.source_name,
                 "donor_key": s.donor_key,
                 "group_label": s.group_label,
-                "library_strategy": s.library_strategy,
+                "library_strategy": attrs.get("library_strategy") or s.library_strategy,
                 "library_source": attrs.get("library_source") or "",
+                "protocol": attrs.get("protocol") or "",
+                "protocol_fields": attrs.get("protocol_fields") or {},
                 "characteristics": load(s.characteristics_json, []),
                 "coverage_incomplete": s.coverage_incomplete,
             }
         )
+    if spec is not None:
+        for row in out:
+            row["group_label"] = infer_group_label(row, spec=spec)
     return out
 
 
@@ -944,7 +1017,8 @@ def _sample_evidence_text(sample: dict[str, Any]) -> str:
     return (
         f"{gsm} title={sample.get('title') or ''} organism={sample.get('organism') or ''} "
         f"source_name={sample.get('source_name') or ''} library_strategy={sample.get('library_strategy') or ''} "
-        f"library_source={sample.get('library_source') or ''} donor_key={sample.get('donor_key') or ''} "
+        f"library_source={sample.get('library_source') or ''} protocol={sample.get('protocol') or ''} "
+        f"donor_key={sample.get('donor_key') or ''} "
         f"group_label={sample.get('group_label') or ''} characteristics={'; '.join(bits)}"
     )[:4000]
 
@@ -987,13 +1061,13 @@ async def _replace_assessments(
         )
 
 
-async def parse_spec_with_optional_llm(text: str, session_id: str) -> ResearchSpec:
+async def parse_spec_with_optional_llm(text: str, session_id: str, *, on_usage=None) -> ResearchSpec:
     base = heuristic_parse(text)
     creds = store.get(session_id)
     mock = settings.llm_mode == "mock"
     if not mock and (not creds or not creds.has_llm_key()):
         return base
-    llm = LLMProvider(creds or store.get_or_create(session_id), mock=mock)
+    llm = LLMProvider(creds or store.get_or_create(session_id), mock=mock, on_usage=on_usage)
     try:
         payload, _usage = await llm.complete_json(
             prompt_name="parse_research_spec",

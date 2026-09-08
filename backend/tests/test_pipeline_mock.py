@@ -269,3 +269,53 @@ async def test_deep_verify_limit_skips_llm_for_unscreened_rest():
             await session.execute(select(Assessment).where(Assessment.run_id == rid, Assessment.stage == "verify_model"))
         ).scalars().all()
         assert {row.gse for row in verify_models} == gses
+
+
+@pytest.mark.asyncio
+async def test_run_budget_tiers_from_one_click_flag():
+    await init_db()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8000") as client:
+        created = await client.post("/api/projects", json={"original_request": "human lung scRNA-seq", "name": "tiers"})
+        pid = created.json()["id"]
+        screen = await client.post(f"/api/projects/{pid}/runs", json={"mode": "full", "one_click": True})
+        deep = await client.post(f"/api/projects/{pid}/runs", json={"mode": "full", "one_click": False})
+        custom = await client.post(
+            f"/api/projects/{pid}/runs",
+            json={"mode": "full", "one_click": True, "budget": {"max_unique_gse": 7, "max_deep_verify": 2}},
+        )
+    assert screen.status_code == 200
+    assert screen.json()["budget"]["max_deep_verify"] == 0
+    assert screen.json()["budget"]["max_unique_gse"] == 150
+    assert screen.json()["config"]["budget_tier"] == "screen"
+    assert deep.json()["budget"]["max_deep_verify"] == 80
+    assert deep.json()["budget"]["max_tokens"] == 1_000_000
+    assert deep.json()["config"]["budget_tier"] == "deep"
+    assert custom.json()["budget"]["max_unique_gse"] == 7
+    assert custom.json()["config"]["budget_tier"] == "custom"
+
+
+@pytest.mark.asyncio
+async def test_screen_budget_skips_soft_and_model_assess():
+    await init_db()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8000") as client:
+        created = await client.post("/api/projects", json={"original_request": "human atherosclerosis scRNA-seq", "name": "screen0"})
+        pid = created.json()["id"]
+        run = await client.post(
+            f"/api/projects/{pid}/runs",
+            json={"mode": "full", "budget": {"max_unique_gse": 3, "max_deep_verify": 0, "max_queries": 4, "esearch_page_size": 20}},
+        )
+        rid = run.json()["id"]
+    await _drain(rid, limit=80)
+    async with SessionLocal() as session:
+        db_run = await session.get(Run, rid)
+        assert db_run is not None
+        assert db_run.status in {"completed", "partial"}
+        rows = (await session.execute(select(RunDataset).where(RunDataset.run_id == rid))).scalars().all()
+        assert rows
+        assert all(r.verification_status not in {"soft_loaded", "soft_incomplete"} for r in rows)
+        models = (
+            await session.execute(select(Assessment).where(Assessment.run_id == rid, Assessment.stage == "assess_model"))
+        ).scalars().all()
+        assert models == []

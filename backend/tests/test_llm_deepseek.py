@@ -87,3 +87,28 @@ async def test_auth_error_does_not_retry():
         with pytest.raises(LLMError) as exc:
             await provider.complete_json(prompt_name="t", system="Return JSON only.", user="ping")
     assert exc.value.status_code == 401
+
+
+def test_models_url_and_parse_ids():
+    from app.connectors.llm import models_url, parse_model_ids
+
+    assert models_url("https://api.openai.com/v1") == "https://api.openai.com/v1/models"
+    assert models_url("https://api.deepseek.com/") == "https://api.deepseek.com/models"
+    assert parse_model_ids({"data": [{"id": "gpt-4o-mini"}, {"id": "gpt-4o"}, {"id": "gpt-4o"}]}) == [
+        "gpt-4o-mini",
+        "gpt-4o",
+    ]
+    assert parse_model_ids({"models": [{"name": "llama3"}]}) == ["llama3"]
+
+
+@pytest.mark.asyncio
+async def test_list_models_openai_compatible():
+    provider = LLMProvider(_creds())
+    with respx.mock:
+        respx.get("https://api.deepseek.com/models").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "deepseek-v4-flash"}, {"id": "deepseek-chat"}]})
+        )
+        result = await provider.list_models()
+    assert result["ok"] is True
+    assert result["models"] == ["deepseek-v4-flash", "deepseek-chat"]
+    assert "key" not in str(result).lower() or "test-key" not in str(result)

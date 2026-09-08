@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -38,20 +39,27 @@ class GeoFtpClient:
         current = _assert_allowed(url)
         limit = max_bytes or settings.max_soft_bytes
         await ncbi_limiter.acquire(bool(self.api_key))
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
-            for _ in range(4):
-                response = await client.get(current)
-                if response.status_code in {301, 302, 303, 307, 308}:
-                    location = response.headers.get("location") or ""
-                    nxt = urljoin(current, location)
-                    current = _assert_allowed(nxt)
-                    continue
-                if response.status_code >= 400:
-                    raise GeoFetchError(f"GEO 文件 HTTP {response.status_code}", response.status_code)
-                data = response.content
-                if len(data) > limit:
-                    raise GeoFetchError("文件超过下载上限，核验不完整")
-                return data, current
+        try:
+            async with asyncio.timeout(self.timeout):
+                async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+                    for _ in range(4):
+                        async with client.stream("GET", current) as response:
+                            if response.status_code in {301, 302, 303, 307, 308}:
+                                location = response.headers.get("location") or ""
+                                current = _assert_allowed(urljoin(current, location))
+                                continue
+                            if response.status_code >= 400:
+                                raise GeoFetchError(f"GEO 文件 HTTP {response.status_code}", response.status_code)
+                            data = bytearray()
+                            async for chunk in response.aiter_bytes():
+                                if len(data) + len(chunk) > limit:
+                                    raise GeoFetchError("文件超过下载上限，核验不完整")
+                                data.extend(chunk)
+                            return bytes(data), current
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            raise GeoFetchError("GEO 文件下载超时，核验不完整") from exc
+        except httpx.HTTPError as exc:
+            raise GeoFetchError(f"GEO 文件网络错误: {type(exc).__name__}") from exc
         raise GeoFetchError("GEO 重定向次数过多")
 
     async def fetch_soft(self, accession: str) -> tuple[bytes, str]:

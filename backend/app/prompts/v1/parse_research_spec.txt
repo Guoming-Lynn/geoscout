@@ -1,6 +1,10 @@
 将用户课题解析为 JSON。无法确定的字段留空或列入 unresolved_questions，不要擅自补全。
 区分必须条件与最好条件。对照类型若未说明，不要把健康供体、邻近组织、未处理、假手术视为等价。
-输出字段：disease, tissues, organisms, assay_types, required_groups, minimum_donors_per_group,
+输出字段：disease, tissues, organisms, assay_types, assay_methods, sample_source, required_groups, minimum_donors_per_group,
 paired_design, required_metadata, preferred_metadata, processed_matrix_requirement, unresolved_questions。
-assay_types 只能是 bulk_rna_seq, scrna_seq, snrna_seq。
+assay_types 只能是 bulk_rna_seq, scrna_seq, snrna_seq, rna_seq_generic, spatial_transcriptomics, proteomics, epigenomics, microbiome。仅写 RNA-seq 时使用 rna_seq_generic，不能默认 bulk。Visium/Xenium/空间转录组用 spatial_transcriptomics，不要同时填 scrna_seq。CITE-seq 用 scrna_seq。蛋白组/质谱用 proteomics，ATAC/ChIP/甲基化用 epigenomics，16S/微生物组用 microbiome。
+assay_methods 只能是 ATAC-seq, ChIP-seq, methylation, Hi-C。用户点名 ATAC-seq/snATAC/scATAC 时 assay_types 填 epigenomics，同时 assay_methods 填 ["ATAC-seq"]。点名 ChIP-seq、甲基化/methylation/bisulfite、Hi-C 时同样保留 epigenomics 并写入对应方法。ChIA-PET 不是 ChIP-seq。仅写表观组/epigenomics 未点名具体方法时 assay_methods 留空。不得把 ATAC 写成 ChIP，也不得丢掉用户点名的具体方法。
+sample_source 只能为 any/primary/cell_line/organoid/xenograft。用户写 primary 并点名组织或样本（plaque、islet、brain、PBMC、tissue/samples）时填 primary；primary progressive 等疾病用法、仅 human/patient-derived 不足以推断。用户点名组织时 tissues 填写原文支持的组织，并把 tissue_required 设为 true；摘要出现组织词不能当作样本取材证据。未指定组织时 tissues 必须为空，tissue_required 为 false；不得添加疾病常见组织。每个提取值必须由用户原文支持，无法解析的明确要求列入 unresolved_questions。
+用户点名的疾病必须写入 disease。IBD / inflammatory bowel disease / 炎症性肠病与 Crohn's disease / 克罗恩病、ulcerative colitis / 溃疡性结肠炎层级不同，不得把 IBD 写成某一种亚型。无法映射到标准名时，disease 仍保留用户原文，并写入 unresolved_questions。不得清空或覆盖原文已支持的疾病；不得添加原文没有的疾病。纯技术或组织检索未点名疾病时，disease 必须为空。
 organisms 使用 Homo sapiens 或 Mus musculus。
+用户要求疾病病例与对照时，required_groups 使用 ["case", "control"]。只有用户明确要求病灶/lesion 分组时才沿用 lesion；不能把普通疾病研究强行变成病灶组织研究。不要添加未要求的健康对照类型、器官、供体数或配对设计。

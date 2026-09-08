@@ -2,8 +2,11 @@ export type ResearchSpec = {
   original_request: string;
   disease: string[];
   tissues: string[];
+  tissue_required?: boolean;
+  sample_source?: string;
   organisms: string[];
   assay_types: string[];
+  assay_methods?: string[];
   required_groups: string[];
   minimum_donors_per_group: number | null;
   preferred_metadata: string[];
@@ -46,11 +49,14 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  health: () => req<{ ncbi_mode: string; llm_mode: string; demo: boolean }>("/api/health"),
+  budgetPresets: () => req<Record<string, Record<string, number>>>("/api/budget-presets"),
+  health: () => req<{ ok: boolean; version: string; ncbi_mode: string; llm_mode: string; demo: boolean }>("/api/health"),
   connections: () => req<Record<string, unknown>>("/api/connections"),
   saveConnections: (body: Record<string, unknown>) => req("/api/connections", { method: "PUT", body: JSON.stringify(body) }),
   testConnections: (body: Record<string, unknown>) => req("/api/connections/test", { method: "POST", body: JSON.stringify(body) }),
-  projects: () => req<{ id: string; name: string; original_request: string; spec: ResearchSpec }[]>("/api/projects"),
+  listModels: (body: Record<string, unknown>) => req<{ ok?: boolean; models?: string[]; message?: string }>("/api/connections/models", { method: "POST", body: JSON.stringify(body) }),
+  clearWorkspace: () => req<{ ok: boolean }>("/api/workspace/clear", { method: "POST" }),
+  projects: () => req<{ id: string; name: string; original_request: string; spec: ResearchSpec; parse_token_usage?: Record<string, number | boolean> }[]>("/api/projects"),
   createProject: (original_request: string, name?: string) =>
     req<{ id: string; name: string; spec: ResearchSpec }>("/api/projects", { method: "POST", body: JSON.stringify({ original_request, name }) }),
   parseSpec: (id: string) => req<{ spec: ResearchSpec; questions: string[] }>(`/api/projects/${id}/spec/parse`, { method: "POST" }),

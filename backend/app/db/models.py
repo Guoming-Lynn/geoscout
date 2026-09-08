@@ -19,6 +19,7 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(200))
     original_request: Mapped[str] = mapped_column(Text, default="")
     spec_json: Mapped[str] = mapped_column(Text, default="{}")
+    parse_usage_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     runs: Mapped[list["Run"]] = relationship(back_populates="project")
@@ -66,6 +67,8 @@ class QueryAttempt(Base):
     query_hash: Mapped[str] = mapped_column(String(64))
     term: Mapped[str] = mapped_column(Text)
     round_no: Mapped[int] = mapped_column(Integer, default=1)
+    query_index: Mapped[int] = mapped_column(Integer, default=0)
+    candidate_limit: Mapped[int] = mapped_column(Integer, default=0)
     source: Mapped[str] = mapped_column(String(40), default="user")
     hit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     new_unique_gse: Mapped[int] = mapped_column(Integer, default=0)

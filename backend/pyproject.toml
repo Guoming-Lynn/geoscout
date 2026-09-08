@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geoscout"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local GEO dataset discovery and evidence-backed screening"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "GEOScout contributors" }]
+authors = [{ name = "Guoming Lin" }]
 dependencies = [
   "fastapi==0.115.12",
   "uvicorn[standard]==0.34.2",
@@ -31,6 +31,7 @@ dev = [
 ]
 
 [project.scripts]
+geoscout = "app.launcher:run"
 geoscout-api = "app.main:run"
 geoscout-worker = "app.worker:run"
 
