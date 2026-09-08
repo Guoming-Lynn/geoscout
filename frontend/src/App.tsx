@@ -254,11 +254,13 @@ export default function App() {
             <Trash2 size={14} /> {t("clearTasks")}
           </button>
         </div>
+        <h4 className="sidebar-section-title">{t("topics")}</h4>
         {(projects.data || []).map((p) => (
           <button key={p.id} className={`task ${p.id === projectId ? "active" : ""}`} onClick={() => { setProjectId(p.id); setSpec(p.spec); setRequest(p.original_request || ""); setRunId(null); setSelected(null); }}>
             {p.name}
           </button>
         ))}
+        {!!projectId && <h4 className="sidebar-section-title">{t("runs")}</h4>}
         {(runs.data || []).map((r) => (
           <button
             key={r.id}
@@ -382,9 +384,9 @@ export default function App() {
               </p>
             )}
             <div className="row">
-              <button className="secondary" onClick={() => api.pause(current.id)}><Pause size={14} /> {t("pause")}</button>
-              <button className="secondary" onClick={() => api.resume(current.id)}><Play size={14} /> {t("resume")}</button>
-              <button className="bad" onClick={async () => {
+              <button className="secondary" disabled={current.status !== "running"} onClick={() => api.pause(current.id)}><Pause size={14} /> {t("pause")}</button>
+              <button className="secondary" disabled={current.status !== "paused"} onClick={() => api.resume(current.id)}><Play size={14} /> {t("resume")}</button>
+              <button className="bad" disabled={!isLive(current.status)} onClick={async () => {
                 setError("");
                 try {
                   await api.cancel(current.id);
@@ -416,7 +418,7 @@ export default function App() {
             <div className="tabs" role="tablist">
               {(["recommended", "needs_review", "excluded"] as const).map((id) => (
                 <button key={id} role="tab" aria-selected={tab === id} className="secondary" onClick={() => setTab(id)}>
-                  {id === "recommended" ? t("recommended") : id === "needs_review" ? t("needsReview") : t("excluded")}
+                  {id === "recommended" ? t("recommended") : id === "needs_review" ? t("needsReview") : t("excluded")} {id === tab ? `(${datasets.data?.total || 0})` : ""}
                 </button>
               ))}
             </div>
@@ -429,7 +431,7 @@ export default function App() {
                 </thead>
                 <tbody>
                   {(datasets.data?.items || []).map((row) => (
-                    <tr key={String(row.gse)} onClick={() => setSelected(String(row.gse))} style={{ cursor: "pointer" }}>
+                    <tr key={String(row.gse)} className={String(row.gse) === selected ? "selected-row" : ""} onClick={() => setSelected(String(row.gse))} style={{ cursor: "pointer" }}>
                       <td>{String(row.gse)}</td>
                       <td>{String(row.title || "")}</td>
                       <td>{String(row.taxon || "")}</td>
@@ -437,7 +439,7 @@ export default function App() {
                         {assayLabels(t, row.assay_kinds, row.assay_kind)}
                         {row.gdstype ? <div className="muted">{String(row.gdstype)}</div> : null}
                       </td>
-                      <td><span className={`pill ${String(row.category)}`}>{statusIcon(String(row.category))} {String(row.category)}</span></td>
+                      <td><span className={`pill ${String(row.category)}`}>{statusIcon(String(row.category))} {String(row.category) === "recommended" ? t("recommended") : String(row.category) === "needs_review" ? t("needsReview") : t("excluded")}</span></td>
                       <td>{String(row.reason || "")}</td>
                     </tr>
                   ))}

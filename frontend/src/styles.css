@@ -168,6 +168,8 @@ tbody tr:hover { background: #f5fafc; }
 }
 .task.active { outline: 2px solid var(--accent); background: #e6f3f7; }
 .task.active.live { background: #dff0e6; }
+.sidebar-section-title { margin: 14px 0 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+.selected-row { background: #e6f3f7 !important; box-shadow: inset 3px 0 var(--accent); }
 .error { color: var(--bad); }
 .gate {
   min-height: 100%;
