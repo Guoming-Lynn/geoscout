@@ -452,7 +452,7 @@ export default function App() {
               </table>
               {(datasets.data?.items || []).length === 0 && <p className="muted">{t("noCandidates")}</p>}
             </div>
-            {detail.data && <Detail data={detail.data} runId={current.id} onOverride={() => qc.invalidateQueries({ queryKey: ["datasets", runId] })} />}
+            {detail.data && <div className="detail-drawer" role="dialog" aria-label={t("detail")}><button className="drawer-close secondary" onClick={() => setSelected(null)} aria-label={t("close")}>×</button><Detail data={detail.data} runId={current.id} onOverride={() => qc.invalidateQueries({ queryKey: ["datasets", runId] })} /></div>}
           </section>
         )}
       </main>
