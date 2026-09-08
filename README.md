@@ -10,7 +10,7 @@
 
 </div>
 
-![GEOScout product poster](docs/assets/geoscout-github-poster-light.png)
+![GEOScout product poster](docs/assets/geoscout-github-poster-light-v2.png)
 
 GEOScout is a local tool for finding and screening datasets in NCBI GEO. Turn a research question into structured criteria, retrieve candidate studies, inspect sample-level evidence, and export a workbook for human review. Use your own model provider, or start with manual NCBI search without a model key.
 
