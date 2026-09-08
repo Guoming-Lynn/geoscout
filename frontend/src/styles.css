@@ -44,6 +44,9 @@ button, input, select, textarea {
 .main > .run-status {
   margin-top: 0;
 }
+.sidebar-toggle { position: fixed; left: 12px; top: 12px; z-index: 6; display: none; width: 34px; height: 34px; padding: 0; }
+.settings-overlay { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 24px; background: rgba(15, 23, 42, .28); }
+.settings-panel { width: min(560px, 100%); max-height: calc(100vh - 48px); overflow: auto; }
 .main > .error { margin-bottom: 12px; overflow-wrap: anywhere; }
 h1, h2, h3 { margin: 0 0 8px; font-weight: 650; }
 h2 { font-size: 22px; letter-spacing: -.02em; }
@@ -239,5 +242,11 @@ tbody tr:hover { background: #f5fafc; }
 .row > input { flex: 1; width: auto; min-width: 0; }
 @media (max-width: 900px) {
   .app { grid-template-columns: 1fr; }
+  .sidebar-toggle { display: block; }
+  .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 5; width: min(300px, 88vw); transform: translateX(-105%); transition: transform .2s ease; }
+  .sidebar-open .sidebar { transform: translateX(0); }
+  .sidebar-open .main { pointer-events: none; }
+  .sidebar-open::after { content: ""; position: fixed; inset: 0; z-index: 4; background: rgba(15,23,42,.24); }
+  .main { padding: 60px 16px 40px; }
   .criteria { grid-template-columns: 1fr; }
 }

@@ -57,6 +57,7 @@ export default function App() {
   const [tab, setTab] = useState<"recommended" | "needs_review" | "excluded">("needs_review");
   const [selected, setSelected] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [error, setError] = useState("");
   const [conn, setConn] = useState<Conn>(defaultConn);
   const [entered, setEntered] = useState(() => hadWorkbench());
@@ -195,7 +196,8 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className={`app ${sidebarOpen ? "sidebar-open" : "sidebar-collapsed"}`}>
+      <button className="sidebar-toggle" aria-label={t("toggleSidebar")} onClick={() => setSidebarOpen((v) => !v)}>☰</button>
       <aside className="sidebar">
         <h1>GEOScout</h1>
         <p className="muted">
@@ -209,7 +211,9 @@ export default function App() {
           <LanguageSelect />
         </div>
         {settingsOpen && (
-          <div className="card stack">
+          <div className="settings-overlay" role="dialog" aria-modal="true" aria-label={t("settings")} onClick={() => setSettingsOpen(false)}>
+          <div className="card stack settings-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="row" style={{ justifyContent: "space-between" }}><h3>{t("settingsBtn")}</h3><button className="secondary" onClick={() => setSettingsOpen(false)}>×</button></div>
             <ConnectionFields conn={conn} onChange={setConn} />
             <button
               onClick={async () => {
@@ -227,6 +231,7 @@ export default function App() {
             >
               {t("testConn")}
             </button>
+          </div>
           </div>
         )}
         <div className="row" style={{ justifyContent: "space-between" }}>
