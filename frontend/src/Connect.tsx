@@ -115,7 +115,7 @@ export function ConnectionFields({
 
   return (
     <div className="stack">
-      <label>
+      <div className="stack">
         <span className="label-row">
           {t("baseUrl")}
           <button
@@ -156,7 +156,7 @@ export function ConnectionFields({
           aria-label={t("baseUrl")}
           placeholder="https://api.openai.com/v1"
         />
-      </label>
+      </div>
       {conn.llm_base_url.trim() && (
         <p className="muted">
           {t("requestHost")}
@@ -251,11 +251,15 @@ export function ConnectGate({
   onChange,
   onReady,
   version,
+  apiError,
+  onRetry,
 }: {
   conn: Conn;
   onChange: (next: Conn) => void;
   onReady: (mode: "model" | "ncbi") => void;
   version: string;
+  apiError?: string;
+  onRetry?: () => void;
 }) {
   const { t } = useI18n();
   const [busy, setBusy] = useState(false);
@@ -282,6 +286,23 @@ export function ConnectGate({
     }
   }
 
+  async function startWithNcbi() {
+    setBusy(true);
+    setMessage("");
+    try {
+      await api.saveConnections(connectionPayload(conn));
+      onChange({ ...conn, llm_api_key: "", ncbi_api_key: "" });
+      rememberWorkbench();
+      onReady("ncbi");
+    } catch (e) {
+      setMessage((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const blocked = busy || Boolean(apiError);
+
   return (
     <div className="gate">
       <div className="gate-card">
@@ -289,28 +310,32 @@ export function ConnectGate({
           <p className="muted">v{version}</p>
           <LanguageSelect />
         </div>
+        <p className="brand-kicker">NCBI GEO</p>
         <h1>GEOScout</h1>
         <p className="muted">{t("tagline")}</p>
         <ConnectionFields conn={conn} onChange={onChange} />
+        {apiError && (
+          <p className="error" role="alert">
+            {apiError}
+          </p>
+        )}
         {message && (
           <p className="error" role="alert">
             {message}
           </p>
         )}
         <div className="stack" style={{ marginTop: 8 }}>
-          <button disabled={busy || !conn.llm_api_key.trim() || !conn.llm_base_url.trim()} onClick={() => void startWithModel()}>
+          <button disabled={blocked || !conn.llm_api_key.trim() || !conn.llm_base_url.trim()} onClick={() => void startWithModel()}>
             {busy ? t("testing") : t("testStart")}
           </button>
-          <button
-            className="secondary"
-            disabled={busy}
-            onClick={() => {
-              rememberWorkbench();
-              onReady("ncbi");
-            }}
-          >
+          <button className="secondary" disabled={blocked} onClick={() => void startWithNcbi()}>
             {t("ncbiOnly")}
           </button>
+          {apiError && onRetry ? (
+            <button className="secondary" type="button" onClick={onRetry}>
+              {t("retry")}
+            </button>
+          ) : null}
         </div>
         <AuthorCredit />
       </div>

@@ -47,8 +47,10 @@ class NCBIClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.tool = (tool or settings.ncbi_tool or "GEOScout").replace(" ", "")
-        self.email = (email if email is not None else settings.ncbi_email).replace(" ", "")
-        self.api_key = api_key if api_key is not None else settings.ncbi_api_key
+        picked_email = email if (email is not None and str(email).strip()) else settings.ncbi_email
+        self.email = (picked_email or "").replace(" ", "")
+        picked_key = api_key if (api_key is not None and str(api_key).strip()) else settings.ncbi_api_key
+        self.api_key = picked_key or ""
         self.timeout = timeout or settings.request_timeout_s
         self._transport = transport
 

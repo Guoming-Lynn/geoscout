@@ -90,7 +90,7 @@ async def claim_job(session: AsyncSession, worker_id: str, lease_s: int) -> Job 
         run = runs.get(job.run_id)
         if run is None:
             continue
-        if run.status == "waiting_for_credentials":
+        if run.status in {"paused", "waiting_for_credentials"} and not run.cancel_requested:
             continue
         if run.status in {"completed", "partial", "failed", "cancelled"}:
             job.status = "cancelled"

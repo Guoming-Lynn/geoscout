@@ -280,11 +280,36 @@ async def get_run(run_id: str, db: AsyncSession = Depends(get_session)) -> dict:
     return _run_view(run)
 
 
+def _resume_step(run: Run) -> str:
+    stage = run.stage or "planning"
+    if stage == "fetching":
+        checkpoint = load(run.checkpoint_json, {})
+        return "deep_fetch" if "deep_targets" in checkpoint else "fetch_summaries"
+    return {
+        "planning": "plan",
+        "searching": "search",
+        "screening": "screen",
+        "verifying": "assess",
+        "exporting": "finalize",
+    }.get(stage, "plan")
+
+
+async def _cancel_open_jobs(db: AsyncSession, run_id: str) -> None:
+    jobs = (await db.execute(select(Job).where(Job.run_id == run_id, Job.status.in_(["queued", "leased", "waiting_credentials"])))).scalars().all()
+    for job in jobs:
+        job.status = "cancelled"
+        job.last_error = "用户取消"
+
+
 @router.post("/runs/{run_id}/pause")
 async def pause_run(run_id: str, db: AsyncSession = Depends(get_session)) -> dict:
     run = await db.get(Run, run_id)
     if not run:
         raise HTTPException(404, "任务不存在")
+    if run.status in {"completed", "partial", "failed", "cancelled"}:
+        raise HTTPException(409, "任务已结束，无法暂停")
+    if run.status in {"paused", "pausing"}:
+        return _run_view(run)
     run.pause_requested = True
     run.status = "pausing"
     await add_event(db, run.id, "已请求暂停，将在当前原子步骤结束后生效")
@@ -298,19 +323,17 @@ async def resume_run(run_id: str, db: AsyncSession = Depends(get_session)) -> di
     if not run:
         raise HTTPException(404, "任务不存在")
     run.pause_requested = False
-    if run.status in {"paused", "waiting_for_credentials"}:
+    if run.status in {"paused", "pausing", "waiting_for_credentials"}:
         run.status = "queued"
         run.stop_reason = ""
-        waiting = (
-            await db.execute(select(Job).where(Job.run_id == run.id, Job.status == "waiting_credentials"))
-        ).scalars().all()
-        for job in waiting:
-            job.status = "queued"
-            job.last_error = ""
-        if not waiting:
-            await enqueue_job(db, run.id, "search") if run.stage == "searching" else await enqueue_job(
-                db, run.id, run.stage if run.stage != "planning" else "plan"
-            )
+        jobs = (await db.execute(select(Job).where(Job.run_id == run.id))).scalars().all()
+        for job in jobs:
+            if job.status == "waiting_credentials":
+                job.status = "queued"
+                job.last_error = ""
+        has_work = any(job.status in {"queued", "leased"} for job in jobs)
+        if not has_work:
+            await enqueue_job(db, run.id, _resume_step(run))
         await add_event(db, run.id, "任务已恢复")
     await db.commit()
     return _run_view(run)
@@ -323,9 +346,16 @@ async def cancel_run(run_id: str, db: AsyncSession = Depends(get_session)) -> di
             run = await db.get(Run, run_id)
             if not run:
                 raise HTTPException(404, "任务不存在")
+            if run.status in {"completed", "partial", "failed", "cancelled"}:
+                return _run_view(run)
             if not run.cancel_requested:
                 run.cancel_requested = True
                 await add_event(db, run.id, "已请求取消。模型若已发出请求，费用无法退回。")
+            if run.status in {"paused", "pausing", "waiting_for_credentials", "queued"}:
+                run.status = "cancelled"
+                run.stop_reason = "用户取消"
+                run.finished_at = datetime.now(timezone.utc)
+                await _cancel_open_jobs(db, run.id)
             await db.commit()
             return _run_view(run)
         except OperationalError as exc:

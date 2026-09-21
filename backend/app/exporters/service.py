@@ -64,23 +64,12 @@ async def build_export_payload(session: AsyncSession, run: Run) -> dict[str, Any
                 "concerns": rd.concerns,
                 "relations": "; ".join(r.target for r in rels),
                 "overridden": bool(ov),
+                "summary": ds.summary if ds else "",
             }
         )
         sample_rows = (await session.execute(select(Sample).where(Sample.gse == rd.gse))).scalars().all()
         for s in sample_rows:
-            samples_out.append(
-                {
-                    "gse": rd.gse,
-                    "gsm": s.gsm,
-                    "title": s.title,
-                    "organism": s.organism,
-                    "source_name": s.source_name,
-                    "donor_key": s.donor_key,
-                    "library_strategy": s.library_strategy,
-                    "characteristics": load(s.characteristics_json, []),
-                    "coverage_incomplete": s.coverage_incomplete,
-                }
-            )
+            samples_out.append({"gse": rd.gse, **sample_record(s)})
     assess_rows = (await session.execute(select(Assessment).where(Assessment.run_id == run.id))).scalars().all()
     evid = {row["evidence_id"]: row for row in await evidence_bundle(session, run.id)}
     spec_obj = ResearchSpec.model_validate(spec) if spec else ResearchSpec()
@@ -93,7 +82,11 @@ async def build_export_payload(session: AsyncSession, run: Run) -> dict[str, Any
         unknown_hard = [
             a.criterion_id for a in finals if a.verdict == "unknown" and a.criterion_id in hard_ids
         ]
-        study = {"taxon": cand.get("taxon") or "", "gdstype": cand.get("gdstype") or "", "summary": ""}
+        study = {
+            "taxon": cand.get("taxon") or "",
+            "gdstype": cand.get("gdstype") or "",
+            "summary": cand.get("summary") or "",
+        }
         cand["applicable_gsms"] = applicable_gsms(
             spec_obj,
             [judgement_from_assessment(a) for a in finals],

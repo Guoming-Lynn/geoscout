@@ -29,17 +29,67 @@ export type RunView = {
   spec: ResearchSpec;
 };
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
-    ...init,
-  });
+const DEFAULT_TIMEOUT_MS = 12_000;
+const LLM_TIMEOUT_MS = 90_000;
+
+function timeoutSignal(ms: number): AbortSignal {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return AbortSignal.timeout(ms);
+  }
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), ms);
+  return controller.signal;
+}
+
+export function formatApiError(body: unknown, fallback: string): string {
+  if (!body || typeof body !== "object") return fallback;
+  const detail = (body as { detail?: unknown }).detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail.map((item) => {
+      if (typeof item === "string") return item;
+      if (item && typeof item === "object" && "msg" in item) return String((item as { msg: unknown }).msg);
+      try {
+        return JSON.stringify(item);
+      } catch {
+        return "";
+      }
+    }).filter(Boolean);
+    return parts.join("; ") || fallback;
+  }
+  try {
+    return JSON.stringify(body);
+  } catch {
+    return fallback;
+  }
+}
+
+async function req<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
+  const { timeoutMs, headers, signal, ...rest } = (init || {}) as RequestInit & { timeoutMs?: number };
+  const method = String(rest.method || "GET").toUpperCase();
+  const merged = new Headers(headers);
+  if (method !== "GET" && method !== "HEAD" && !merged.has("Content-Type")) {
+    merged.set("Content-Type", "application/json");
+  }
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      credentials: "include",
+      ...rest,
+      headers: merged,
+      signal: signal ?? timeoutSignal(timeoutMs ?? DEFAULT_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const name = err instanceof DOMException ? err.name : err instanceof Error ? err.name : "";
+    if (name === "AbortError" || name === "TimeoutError") {
+      throw new Error("Local API did not respond. Start GEOScout.bat and retry.");
+    }
+    throw err;
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try {
-      const body = await res.json();
-      detail = body.detail || JSON.stringify(body);
+      detail = formatApiError(await res.json(), detail);
     } catch {
       /* ignore */
     }
@@ -53,13 +103,20 @@ export const api = {
   health: () => req<{ ok: boolean; version: string; ncbi_mode: string; llm_mode: string; demo: boolean }>("/api/health"),
   connections: () => req<Record<string, unknown>>("/api/connections"),
   saveConnections: (body: Record<string, unknown>) => req("/api/connections", { method: "PUT", body: JSON.stringify(body) }),
-  testConnections: (body: Record<string, unknown>) => req("/api/connections/test", { method: "POST", body: JSON.stringify(body) }),
-  listModels: (body: Record<string, unknown>) => req<{ ok?: boolean; models?: string[]; message?: string }>("/api/connections/models", { method: "POST", body: JSON.stringify(body) }),
+  testConnections: (body: Record<string, unknown>) =>
+    req("/api/connections/test", { method: "POST", body: JSON.stringify(body), timeoutMs: LLM_TIMEOUT_MS }),
+  listModels: (body: Record<string, unknown>) =>
+    req<{ ok?: boolean; models?: string[]; message?: string }>("/api/connections/models", {
+      method: "POST",
+      body: JSON.stringify(body),
+      timeoutMs: LLM_TIMEOUT_MS,
+    }),
   clearWorkspace: () => req<{ ok: boolean }>("/api/workspace/clear", { method: "POST" }),
   projects: () => req<{ id: string; name: string; original_request: string; spec: ResearchSpec; parse_token_usage?: Record<string, number | boolean> }[]>("/api/projects"),
   createProject: (original_request: string, name?: string) =>
     req<{ id: string; name: string; spec: ResearchSpec }>("/api/projects", { method: "POST", body: JSON.stringify({ original_request, name }) }),
-  parseSpec: (id: string) => req<{ spec: ResearchSpec; questions: string[] }>(`/api/projects/${id}/spec/parse`, { method: "POST" }),
+  parseSpec: (id: string) =>
+    req<{ spec: ResearchSpec; questions: string[] }>(`/api/projects/${id}/spec/parse`, { method: "POST", timeoutMs: LLM_TIMEOUT_MS }),
   saveSpec: (id: string, spec: ResearchSpec) => req(`/api/projects/${id}/spec`, { method: "PUT", body: JSON.stringify(spec) }),
   createRun: (id: string, body: Record<string, unknown>) => req<RunView>(`/api/projects/${id}/runs`, { method: "POST", body: JSON.stringify(body) }),
   listRuns: (id: string) => req<RunView[]>(`/api/projects/${id}/runs`),
@@ -73,5 +130,10 @@ export const api = {
   dataset: (id: string, gse: string) => req<Record<string, unknown>>(`/api/runs/${id}/datasets/${gse}`),
   override: (id: string, gse: string, category: string, reason: string) =>
     req(`/api/runs/${id}/datasets/${gse}/override`, { method: "POST", body: JSON.stringify({ category, reason }) }),
-  exportRun: (id: string) => req<{ id: string; filename: string; download: string; complete: boolean; status: string }>(`/api/runs/${id}/exports`, { method: "POST", body: JSON.stringify({ include_json: true }) }),
+  exportRun: (id: string) =>
+    req<{ id: string; filename: string; download: string; complete: boolean; status: string }>(`/api/runs/${id}/exports`, {
+      method: "POST",
+      body: JSON.stringify({ include_json: true }),
+      timeoutMs: 60_000,
+    }),
 };

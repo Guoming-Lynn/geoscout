@@ -1,10 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { connectionPayload, defaultConn, matchProvider } from "./Connect";
+import { formatApiError } from "./api/client";
 import { nextRunId, runOwnedByProject, safeHost, totalTokens } from "./testable";
 
 it("includes output tokens even when input tokens are zero", () => {
   expect(totalTokens({ prompt_tokens: 0, completion_tokens: 2048 })).toBe(2048);
   expect(totalTokens({ prompt_tokens: 100, completion_tokens: 2048, estimated: true })).toBe(2148);
+});
+
+it("formats FastAPI validation arrays instead of [object Object]", () => {
+  expect(formatApiError({ detail: [{ msg: "manual query required" }] }, "fallback")).toBe("manual query required");
+  expect(formatApiError({ detail: "任务不存在" }, "fallback")).toBe("任务不存在");
 });
 
 describe("url host display", () => {
@@ -40,6 +46,10 @@ describe("project run stickiness", () => {
   it("keeps a run that belongs to the topic and otherwise selects the latest", () => {
     expect(nextRunId([{ id: "b" }, { id: "a" }], "a")).toBe("a");
     expect(nextRunId([{ id: "b" }], "a")).toBe("b");
+  });
+  it("rejects a run missing project_id instead of treating it as owned", () => {
+    expect(runOwnedByProject({ id: "r1" }, "A")).toBe(false);
+    expect(runOwnedByProject({ id: "r1", project_id: "" }, "A")).toBe(false);
   });
   it("rejects export targets from another topic", () => {
     expect(runOwnedByProject({ id: "r1", project_id: "A" }, "B")).toBe(false);

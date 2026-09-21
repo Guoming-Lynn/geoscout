@@ -1,14 +1,16 @@
 from types import SimpleNamespace
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app.db.models import Job, Project, Run
 from app.db.session import SessionLocal, init_db
 from app.evidence.store import new_id
+from app.main import app
 from app.pipeline.engine import Engine, WaitingForCredentials
-from app.pipeline.repo import claim_job, enqueue_job
+from app.pipeline.repo import claim_job, dump, enqueue_job
 from app.prompts import load_prompt
 from app.schemas.spec import Budget
 from app.pipeline.spec_parse import heuristic_parse
@@ -50,11 +52,13 @@ async def test_claim_skips_waiting_and_terminal_runs():
         session.add(project)
         await session.flush()
         waiting = Run(id=new_id(), project_id=project.id, status="waiting_for_credentials")
+        paused = Run(id=new_id(), project_id=project.id, status="paused")
         live = Run(id=new_id(), project_id=project.id, status="queued")
         done = Run(id=new_id(), project_id=project.id, status="completed")
-        session.add_all([waiting, live, done])
+        session.add_all([waiting, paused, live, done])
         await session.flush()
         session.add(Job(id=new_id(), run_id=waiting.id, step="assess", status="queued"))
+        session.add(Job(id=new_id(), run_id=paused.id, step="verify", status="queued"))
         done_job = Job(id=new_id(), run_id=done.id, step="assess", status="queued")
         session.add(done_job)
         live_job = Job(id=new_id(), run_id=live.id, step="plan", status="queued")
@@ -222,3 +226,82 @@ async def test_engine_waiting_marks_job_not_queued(monkeypatch):
     await engine.run()
     assert job.status == "waiting_credentials"
     assert run.status == "waiting_for_credentials"
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_enqueue_stage_name_when_job_exists():
+    await init_db()
+    async with SessionLocal() as session:
+        await session.execute(update(Job).where(Job.status.in_(["queued", "leased"])).values(status="done"))
+        project = Project(id=new_id(), name="resume-keep", original_request="x")
+        session.add(project)
+        await session.flush()
+        run = Run(id=new_id(), project_id=project.id, status="paused", stage="verifying", pause_requested=True)
+        session.add(run)
+        await session.flush()
+        existing = Job(id=new_id(), run_id=run.id, step="assess", status="queued")
+        session.add(existing)
+        await session.commit()
+        rid, jid = run.id, existing.id
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
+        response = await client.post(f"/api/runs/{rid}/resume")
+        assert response.status_code == 200
+        assert response.json()["status"] == "queued"
+    async with SessionLocal() as session:
+        jobs = (await session.execute(select(Job).where(Job.run_id == rid))).scalars().all()
+        queued = [job for job in jobs if job.status == "queued"]
+        assert [job.step for job in queued] == ["assess"]
+        assert queued[0].id == jid
+        assert all(job.step != "verifying" for job in jobs)
+
+
+@pytest.mark.asyncio
+async def test_resume_without_jobs_maps_verifying_to_assess():
+    await init_db()
+    async with SessionLocal() as session:
+        await session.execute(update(Job).where(Job.status.in_(["queued", "leased"])).values(status="done"))
+        project = Project(id=new_id(), name="resume-map", original_request="x")
+        session.add(project)
+        await session.flush()
+        run = Run(
+            id=new_id(),
+            project_id=project.id,
+            status="paused",
+            stage="verifying",
+            pause_requested=True,
+            checkpoint_json=dump({"deep_targets": ["GSE1"]}),
+        )
+        session.add(run)
+        await session.commit()
+        rid = run.id
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
+        response = await client.post(f"/api/runs/{rid}/resume")
+        assert response.status_code == 200
+    async with SessionLocal() as session:
+        jobs = (await session.execute(select(Job).where(Job.run_id == rid, Job.status == "queued"))).scalars().all()
+        assert [job.step for job in jobs] == ["assess"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_paused_run_finishes_without_worker():
+    await init_db()
+    async with SessionLocal() as session:
+        await session.execute(update(Job).where(Job.status.in_(["queued", "leased"])).values(status="done"))
+        project = Project(id=new_id(), name="cancel-paused", original_request="x")
+        session.add(project)
+        await session.flush()
+        run = Run(id=new_id(), project_id=project.id, status="paused", stage="verifying")
+        session.add(run)
+        await session.flush()
+        session.add(Job(id=new_id(), run_id=run.id, step="assess", status="queued"))
+        await session.commit()
+        rid = run.id
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
+        response = await client.post(f"/api/runs/{rid}/cancel")
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+    async with SessionLocal() as session:
+        db_run = await session.get(Run, rid)
+        jobs = (await session.execute(select(Job).where(Job.run_id == rid))).scalars().all()
+        assert db_run is not None and db_run.status == "cancelled"
+        assert all(job.status == "cancelled" for job in jobs)

@@ -2,7 +2,6 @@ import pytest
 from sqlalchemy import select
 
 from app.connectors.llm import LLMError, validate_assessment
-from app.core.credentials import store
 from app.db.models import Assessment, Job, QueryAttempt, Run, RunDataset
 from app.db.session import SessionLocal, init_db
 from app.evidence.store import quote_in_text
@@ -18,6 +17,17 @@ from datetime import datetime, timezone, timedelta
 async def _drain(run_id: str, limit: int = 80) -> None:
     for _ in range(limit):
         async with SessionLocal() as session:
+            run = await session.get(Run, run_id)
+            if run is None or run.status in {
+                "completed",
+                "partial",
+                "failed",
+                "cancelled",
+                "paused",
+                "pausing",
+                "waiting_for_credentials",
+            }:
+                return
             jobs = (
                 await session.execute(
                     select(Job).where(Job.run_id == run_id, Job.status.in_(["queued", "leased"]))
@@ -77,7 +87,6 @@ async def test_mock_pipeline_and_export():
         await session.commit()
         audit = Path(export.path).with_suffix(".audit.json").read_text(encoding="utf-8")
         assert "sk-real" not in audit
-        assert store.get(db_run.session_id) is not None or True
 
 
 @pytest.mark.asyncio
@@ -122,19 +131,14 @@ async def test_pause_then_cancel():
         rid = run.json()["id"]
         paused = await client.post(f"/api/runs/{rid}/pause")
         assert paused.status_code == 200
-    await _drain(rid, limit=3)
-    async with SessionLocal() as session:
-        db_run = await session.get(Run, rid)
-        assert db_run is not None
-        assert db_run.status in {"paused", "pausing", "queued", "running", "completed", "partial"}
-    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:8000") as client:
+        assert paused.json()["status"] == "pausing"
         cancelled = await client.post(f"/api/runs/{rid}/cancel")
         assert cancelled.status_code == 200
-    await _drain(rid)
+        assert cancelled.json()["status"] == "cancelled"
     async with SessionLocal() as session:
         db_run = await session.get(Run, rid)
         assert db_run is not None
-        assert db_run.status in {"cancelled", "completed", "partial", "paused"}
+        assert db_run.status == "cancelled"
 
 
 @pytest.mark.asyncio

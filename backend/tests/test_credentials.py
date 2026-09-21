@@ -36,3 +36,13 @@ def test_live_llm_without_key_raises_wait(monkeypatch):
     run = SimpleNamespace(session_id="no-key", config_summary="{}")
     with pytest.raises(WaitingForCredentials):
         engine._llm(run)
+
+
+def test_empty_ncbi_email_uses_settings(monkeypatch):
+    from app.connectors.ncbi import NCBIClient
+
+    monkeypatch.setattr("app.connectors.ncbi.settings.ncbi_email", "lab@example.org")
+    monkeypatch.setattr("app.connectors.ncbi.settings.ncbi_api_key", "env-key")
+    client = NCBIClient(email="", api_key="")
+    assert client.email == "lab@example.org"
+    assert client.api_key == "env-key"

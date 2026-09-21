@@ -20,6 +20,6 @@ export function runOwnedByProject(
   run: { id: string; project_id?: string } | undefined,
   projectId: string | null,
 ): boolean {
-  if (!run || !projectId) return false;
-  return !run.project_id || run.project_id === projectId;
+  if (!run || !projectId || !run.project_id) return false;
+  return run.project_id === projectId;
 }

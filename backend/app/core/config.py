@@ -41,11 +41,12 @@ class Settings(BaseSettings):
             "http://127.0.0.1:5173",
             "http://localhost:5173",
             "http://127.0.0.1:8000",
+            "http://localhost:8000",
         ]
     )
     max_soft_bytes: int = 50_000_000
     request_timeout_s: float = 45.0
-    job_lease_s: int = 45
+    job_lease_s: int = 90
     snapshot_ttl_days: int = 30
     api_url: str = "http://127.0.0.1:8000"
 

@@ -46,9 +46,6 @@ export default function App() {
   const qc = useQueryClient();
   const [tier, setTier] = useState<"low" | "medium" | "high" | "ultra">("medium");
   const [deepLimit, setDeepLimit] = useState("");
-  const presets = useQuery({ queryKey: ["budget-presets"], queryFn: api.budgetPresets });
-  const health = useQuery({ queryKey: ["health"], queryFn: api.health });
-  const projects = useQuery({ queryKey: ["projects"], queryFn: api.projects });
   const [request, setRequest] = useState("");
   const [manualQuery, setManualQuery] = useState("");
   const [projectId, setProjectId] = useState<string | null>(null);
@@ -57,22 +54,27 @@ export default function App() {
   const [tab, setTab] = useState<"recommended" | "needs_review" | "excluded">("needs_review");
   const [selected, setSelected] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(() => typeof window !== "undefined" && window.matchMedia("(min-width: 901px)").matches);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [conn, setConn] = useState<Conn>(defaultConn);
   const [entered, setEntered] = useState(() => hadWorkbench());
-  const session = useQuery({ queryKey: ["connections"], queryFn: api.connections });
+  const health = useQuery({ queryKey: ["health"], queryFn: api.health, retry: false });
+  const session = useQuery({ queryKey: ["connections"], queryFn: api.connections, retry: false });
   const keyPresent = Boolean(session.data?.llm_key_present);
-  const ready = entered || keyPresent;
+  const bootstrapFailed = (session.isError && !session.data) || (health.isError && !health.data);
+  const workbench = (entered || keyPresent) && !bootstrapFailed;
+  const presets = useQuery({ queryKey: ["budget-presets"], queryFn: api.budgetPresets, enabled: workbench });
+  const projects = useQuery({ queryKey: ["projects"], queryFn: api.projects, enabled: workbench });
+  const ready = workbench;
 
   useEffect(() => {
     const d = session.data;
-    if (!d?.llm_key_present) return;
+    if (!d) return;
     setConn((c) => ({
       ...c,
-      llm_base_url: String(d.llm_base_url || c.llm_base_url),
-      llm_model: String(d.llm_model || c.llm_model),
+      llm_base_url: d.llm_key_present ? String(d.llm_base_url || c.llm_base_url) : c.llm_base_url,
+      llm_model: d.llm_key_present ? String(d.llm_model || c.llm_model) : c.llm_model,
       ncbi_email: String(d.ncbi_email || c.ncbi_email),
     }));
   }, [session.data]);
@@ -170,10 +172,12 @@ export default function App() {
   const active = starting || isLive(current?.status);
   const demo = health.data?.demo;
 
-  if (session.isPending && !entered) {
+  const checking = !entered && (session.isPending || health.isPending) && !bootstrapFailed;
+  if (checking) {
     return (
       <div className="gate">
         <div className="gate-card">
+          <p className="brand-kicker">NCBI GEO</p>
           <h1>GEOScout</h1>
           <p className="muted">{t("checking")}</p>
           <AuthorCredit />
@@ -188,6 +192,11 @@ export default function App() {
         conn={conn}
         onChange={setConn}
         version={health.data?.version || "0.1.1"}
+        apiError={bootstrapFailed ? t("apiUnreachable") : ""}
+        onRetry={() => {
+          void qc.invalidateQueries({ queryKey: ["health"] });
+          void qc.invalidateQueries({ queryKey: ["connections"] });
+        }}
         onReady={() => {
           setEntered(true);
           qc.invalidateQueries({ queryKey: ["connections"] });
@@ -200,7 +209,10 @@ export default function App() {
     <div className={`app ${sidebarOpen ? "sidebar-open" : "sidebar-collapsed"}`}>
       <button className="sidebar-toggle" aria-label={t("toggleSidebar")} onClick={() => setSidebarOpen((v) => !v)}>☰</button>
       <aside className="sidebar">
-        <h1>GEOScout</h1>
+        <div className="brand">
+          <p className="brand-kicker">NCBI GEO</p>
+          <h1>GEOScout</h1>
+        </div>
         <p className="muted">
           {t("workbenchTagline")} v{health.data?.version || "0.1.1"}
         </p>
@@ -307,7 +319,7 @@ export default function App() {
             )}
           </div>
         )}
-        <section className="stack">
+        <section className="stack panel-card">
           <h2>{t("topic")}</h2>
           <textarea
             value={request}
@@ -358,7 +370,7 @@ export default function App() {
           </button>
         </section>
         {current && (
-          <section>
+          <section className="panel-card results-card">
             <h2>{t("run")}</h2>
             <p>
               {t("stage")} {current.stage}　{t("status")} {statusLabel(current.status, t)}　{t("queries")} {current.counters.queries_done || 0}　{t("uniqueGse")} {current.counters.unique_gse || 0}
@@ -391,9 +403,25 @@ export default function App() {
               </p>
             )}
             <div className="row">
-              <button className="secondary" disabled={current.status !== "running"} onClick={() => api.pause(current.id)}><Pause size={14} /> {t("pause")}</button>
-              <button className="secondary" disabled={current.status !== "paused"} onClick={() => api.resume(current.id)}><Play size={14} /> {t("resume")}</button>
-              <button className="bad" disabled={!isLive(current.status)} onClick={async () => {
+              <button className="secondary" disabled={current.status !== "running"} onClick={async () => {
+                setError("");
+                try {
+                  await api.pause(current.id);
+                  await qc.invalidateQueries({ queryKey: ["run", current.id] });
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : String(e));
+                }
+              }}><Pause size={14} /> {t("pause")}</button>
+              <button className="secondary" disabled={current.status !== "paused" && current.status !== "pausing"} onClick={async () => {
+                setError("");
+                try {
+                  await api.resume(current.id);
+                  await qc.invalidateQueries({ queryKey: ["run", current.id] });
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : String(e));
+                }
+              }}><Play size={14} /> {t("resume")}</button>
+              <button className="bad" disabled={!isLive(current.status) && current.status !== "paused"} onClick={async () => {
                 setError("");
                 try {
                   await api.cancel(current.id);
@@ -404,8 +432,13 @@ export default function App() {
               }}>{t("cancel")}</button>
               <button
                 onClick={async () => {
-                  const exp = await api.exportRun(current.id);
-                  window.location.href = exp.download;
+                  setError("");
+                  try {
+                    const exp = await api.exportRun(current.id);
+                    window.location.href = exp.download;
+                  } catch (e) {
+                    setError(e instanceof Error ? e.message : String(e));
+                  }
                 }}
               >
                 <Download size={14} /> {t("exportExcel")}
@@ -423,11 +456,14 @@ export default function App() {
               </table>
             </div>
             <div className="tabs" role="tablist">
-              {(["recommended", "needs_review", "excluded"] as const).map((id) => (
-                <button key={id} role="tab" aria-selected={tab === id} className="secondary" onClick={() => setTab(id)}>
-                  {id === "recommended" ? t("recommended") : id === "needs_review" ? t("needsReview") : t("excluded")} {id === tab ? `(${datasets.data?.total || 0})` : ""}
+              {(["recommended", "needs_review", "excluded"] as const).map((id) => {
+                const label = id === "recommended" ? t("recommended") : id === "needs_review" ? t("needsReview") : t("excluded");
+                return (
+                <button key={id} role="tab" aria-label={label} aria-selected={tab === id} className="secondary" onClick={() => setTab(id)}>
+                  {label}{id === tab ? <span aria-hidden="true">{` (${datasets.data?.total || 0})`}</span> : null}
                 </button>
-              ))}
+                );
+              })}
             </div>
             <div className="table-wrap">
               <table>
