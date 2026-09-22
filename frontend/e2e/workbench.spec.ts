@@ -11,6 +11,18 @@ async function enterWorkbench(page: import("@playwright/test").Page) {
   }
 }
 
+async function revealSidebar(page: import("@playwright/test").Page) {
+  const mobile = await page.evaluate(() => window.matchMedia("(max-width: 900px)").matches);
+  if (!mobile) return;
+  const toggle = page.getByRole("button", { name: "Toggle sidebar" });
+  await expect(toggle).toBeVisible();
+  const drawer = page.locator("aside.sidebar");
+  const box = await drawer.boundingBox();
+  if (box && box.x >= -1) return;
+  await toggle.click();
+  await expect.poll(async () => (await drawer.boundingBox())?.x ?? -999).toBeGreaterThanOrEqual(-1);
+}
+
 test("startup shows connection gate then NCBI skip enters workbench", async ({ page }) => {
   if (process.env.GEOSCOUT_E2E_LIVE !== "1") {
     await installMockApi(page, [], { exportRunIds: [] });
@@ -52,6 +64,7 @@ test("workbench renders and settings are labeled", async ({ page }) => {
   await expect(intensity.locator("option")).toHaveText(["Low", "Medium", "High", "Ultra"]);
   await intensity.selectOption("ultra");
   await expect(intensity).toHaveValue("ultra");
+  await revealSidebar(page);
   await page.getByRole("button", { name: "Open settings" }).click();
   await expect(page.getByLabel("Model base URL")).toBeVisible();
   await expect(page.getByLabel("Topic")).toBeVisible();
@@ -93,8 +106,9 @@ test("manual search, status, detail, excel, empty and error states", async ({ pa
   const buf = await import("node:fs/promises").then((fs) => fs.readFile(saved!));
   expect(buf.subarray(0, 2).toString()).toBe("PK");
   expect(buf.byteLength).toBeGreaterThan(1000);
+  await revealSidebar(page);
   await page.getByRole("button", { name: "Open settings" }).click();
   await page.getByRole("button", { name: "Test connection" }).click();
-  await expect(page.getByRole("alert")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByRole("alert").or(page.getByText(/mock 模型模式|请先填写模型 API Key/))).toBeVisible({ timeout: 10_000 });
   await page.screenshot({ path: testInfo.outputPath("workbench.png"), fullPage: true });
 });

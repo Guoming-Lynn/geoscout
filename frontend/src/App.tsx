@@ -233,9 +233,15 @@ export default function App() {
                 try {
                   const body = connectionPayload(conn);
                   await api.saveConnections(body);
-                  const r = await api.testConnections(body);
+                  const r = (await api.testConnections(body)) as { ok?: boolean; message?: string };
                   setConn({ ...conn, llm_api_key: "", ncbi_api_key: "" });
-                  setNotice(r && (r as { message?: string }).message ? String((r as { message?: string }).message) : t("testConn"));
+                  if (r?.ok === false) {
+                    setNotice("");
+                    setError(r.message || t("testConn"));
+                  } else {
+                    setError("");
+                    setNotice(r?.message || t("testConn"));
+                  }
                   qc.invalidateQueries({ queryKey: ["connections"] });
                 } catch (e) {
                   setError((e as Error).message);
