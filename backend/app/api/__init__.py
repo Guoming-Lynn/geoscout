@@ -489,6 +489,8 @@ async def list_datasets(
                 "soft_score": rd.soft_score,
                 "selection": load(rd.first_assess_json, {}).get("selection", {}),
                 "independent_donors": rd.independent_donors,
+                "biosample_count": rd.biosample_count,
+                "matrix_availability": rd.matrix_availability,
                 "processed_data": rd.processed_data,
             }
         )
@@ -559,8 +561,11 @@ async def dataset_detail(run_id: str, gse: str, db: AsyncSession = Depends(get_s
             "concerns": rd.concerns,
             "gsm_count": rd.gsm_count,
             "independent_donors": rd.independent_donors,
+            "biosample_count": rd.biosample_count,
             "donors_per_group": load(rd.donors_per_group_json, {}),
             "processed_data": rd.processed_data,
+            "matrix_availability": rd.matrix_availability,
+            "file_listing_checked": rd.file_listing_checked,
             "raw_data": rd.raw_data,
             "hard_unknowns": rd.hard_unknowns,
             "soft_score": rd.soft_score,

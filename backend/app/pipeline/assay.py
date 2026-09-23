@@ -13,11 +13,12 @@ AssayKind = Literal[
     "proteomics",
     "epigenomics",
     "microbiome",
+    "small_rna",
     "other",
 ]
 RNA_KINDS = {"scrna_seq", "snrna_seq", "bulk_rna_seq", "rna_seq_generic"}
 FINE_RNA = {"scrna_seq", "snrna_seq", "bulk_rna_seq"}
-TYPED_NONRNA = {"spatial_transcriptomics", "proteomics", "epigenomics", "microbiome"}
+TYPED_NONRNA = {"spatial_transcriptomics", "proteomics", "epigenomics", "microbiome", "small_rna"}
 KIND_ORDER = (
     "spatial_transcriptomics",
     "scrna_seq",
@@ -27,6 +28,7 @@ KIND_ORDER = (
     "proteomics",
     "epigenomics",
     "microbiome",
+    "small_rna",
     "other",
 )
 
@@ -88,6 +90,11 @@ EPIGEN_HINTS = (
     "表观",
 )
 RNA_STRATEGY = re.compile(r"rna[\s\-]?seq")
+SMALL_RNA_RE = re.compile(
+    r"\b(?:mi|micro|nc)[\s\-]?rna[\s\-]?seq\b|\bsmall[\s\-]?rna[\s\-]?seq\b",
+    re.I,
+)
+SMALL_RNA_STRATEGY = {"mirnaseq", "micrornaseq", "ncrnaseq", "smallrnaseq"}
 EPIGEN_STRATEGY = {
     "atacseq",
     "chipseq",
@@ -148,6 +155,15 @@ def infer_sample_assay(sample: dict[str, Any], study: dict[str, Any] | None = No
             kinds=("other",),
             methods=_sample_methods(sample),
         )
+    if normalized_strategy in SMALL_RNA_STRATEGY:
+        return AssayCall(
+            kind="small_rna",
+            confidence="explicit",
+            evidence=strategy or "small RNA",
+            source="sample",
+            kinds=("small_rna",),
+            methods=_sample_methods(sample),
+        )
     sample_blob = _sample_blob(sample)
     sample_call = _from_blob(sample_blob, source="sample")
     sample_call = _with_methods(sample_call, _sample_methods(sample))
@@ -169,6 +185,38 @@ def infer_study_assay(study: dict[str, Any] | None) -> AssayCall:
     if isinstance(gdstype, (list, tuple)):
         row["gdstype"] = " ".join(str(item) for item in gdstype)
     return _from_blob(_study_blob(row), source="study")
+
+
+def mixed_omics_note(study: dict[str, Any] | None, samples: list[dict[str, Any]] | None = None) -> str:
+    """Warn when one GEO series mixes RNA-seq with another omics type."""
+    if samples:
+        sample_kinds: list[str] = []
+        for sample in samples:
+            call = infer_sample_assay(sample, None)
+            for kind in call.kinds or ((call.kind,) if call.kind else ()):
+                if kind and kind not in sample_kinds and kind not in {"unknown", "other"}:
+                    sample_kinds.append(kind)
+        study_kinds = [kind for kind in infer_study_assay(study).kinds if kind not in {"unknown", "other"}]
+        sample_rna = any(kind in RNA_KINDS for kind in sample_kinds)
+        extra = [
+            kind for kind in study_kinds
+            if kind not in sample_kinds and not (sample_rna and kind in RNA_KINDS)
+        ]
+        rna = [kind for kind in sample_kinds if kind in RNA_KINDS]
+        other = [kind for kind in sample_kinds if kind in TYPED_NONRNA]
+        notes: list[str] = []
+        if rna and other:
+            notes.append("系列同时包含 " + "、".join(sample_kinds) + "，结论只覆盖与课题匹配的样本子集。")
+        if extra:
+            shown = "、".join(sample_kinds) or "未识别的技术"
+            notes.append(f"标题/摘要提到 {'、'.join(extra)}，但 GEO 样本中只有 {shown}。")
+        return " ".join(notes)
+    kinds = [kind for kind in study_assay_kinds(study, samples) if kind not in {"unknown", "other"}]
+    rna = [kind for kind in kinds if kind in RNA_KINDS]
+    other = [kind for kind in kinds if kind in TYPED_NONRNA]
+    if not rna or not other:
+        return ""
+    return "系列同时包含 " + "、".join(kinds) + "，结论只覆盖与课题匹配的样本子集。"
 
 
 def study_assay_kind(study: dict[str, Any] | None, samples: list[dict[str, Any]] | None = None) -> str:
@@ -379,9 +427,27 @@ def _study_blob(study: dict[str, Any]) -> str:
     )
 
 
+_16S_RE = re.compile(r"(?<![a-z0-9\-])16s\b")
+_RRNA_DEPLETION_RE = re.compile(r"mitochondri|\b(?:18s|28s|12s)\b|deplet|ribo[\s\-]?zero|zapr|r-probe")
+
+
+def _16s_hit(lower: str) -> bool:
+    for match in _16S_RE.finditer(lower):
+        window = lower[max(0, match.start() - 80): match.end() + 40]
+        if not _RRNA_DEPLETION_RE.search(window):
+            return True
+    return False
+
+
 def _hint_hit(blob: str, hints: tuple[str, ...]) -> str:
     lower = blob.lower()
-    return next((hint for hint in hints if hint in lower), "")
+    for hint in hints:
+        if hint == "16s":
+            if _16s_hit(lower):
+                return hint
+        elif hint in lower:
+            return hint
+    return ""
 
 
 def _spatial_hit(lower: str) -> str:
@@ -476,6 +542,10 @@ def _collect_kinds(blob: str) -> list[tuple[AssayKind, str, Literal["explicit", 
         add("scrna_seq", "single-cell")
     if any(h in lower for h in BULK_HINTS):
         add("bulk_rna_seq", "bulk")
-    if RNA_STRATEGY.search(lower) and not (seen & FINE_RNA) and "spatial_transcriptomics" not in seen:
+    small = SMALL_RNA_RE.search(lower)
+    if small:
+        add("small_rna", small.group(0))
+    rna_text = SMALL_RNA_RE.sub(" ", lower)
+    if RNA_STRATEGY.search(rna_text) and not (seen & FINE_RNA) and "spatial_transcriptomics" not in seen:
         add("rna_seq_generic", "RNA-Seq", "generic")
     return out

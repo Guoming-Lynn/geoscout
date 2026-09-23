@@ -48,11 +48,72 @@ TREATMENT_GROUP_NAMES = {"treated", "untreated"}
 
 # Short labels are interpreted only in the context of the requested disease.
 DISEASE_LABELS = {
-    "alzheimer disease": ["AD", "sAD", "LOAD", "EOAD", "SAD", "MAD"],
-    "type 2 diabetes": ["T2D", "T2DM"],
+    "alzheimer disease": ["AD", "sAD", "LOAD", "EOAD", "SAD", "MAD", "Alzheimer's", "Alzheimers"],
+    "type 2 diabetes": ["T2D", "T2DM", "type 2 diabetic", "T2 diabetic", "diabetic"],
     "rheumatoid arthritis": ["RA", "Rheumatiod arthritis", "rhematoid arthritis"],
     "COVID-19": ["COVID", "COVID19", "SARS-CoV-2"],
 }
+# Exact folded values on a group-like field. Not matched as substrings.
+DISEASE_CONTROL_LABELS = {
+    "type 2 diabetes": [
+        "nd",
+        "non diabetic",
+        "nondiabetic",
+        "non t2d",
+        "ngt",
+        "normoglycemic",
+        "normal glucose tolerance",
+    ],
+}
+_GROUP_KEY_PARTS = ("status", "diagnos", "group", "condition", "disease", "phenotype", "cohort", "state")
+_CONTROL_EXACT = {
+    "hc",
+    "hcs",
+    "ctrl",
+    "ctrls",
+    "con",
+    "control",
+    "controls",
+    "healthy control",
+    "healthy controls",
+    "hv",
+    "healthy volunteer",
+    "healthy volunteers",
+    "normal control",
+    "normal controls",
+    "non diabetic",
+    "uninfected",
+}
+_TREATMENT_KEYS = {
+    "treatment",
+    "stimulation",
+    "stimulus",
+    "agent",
+    "compound",
+    "drug",
+    "exposure",
+    "culture condition",
+}
+_BASELINE_TREATMENT = {
+    "untreated",
+    "none",
+    "no treatment",
+    "baseline",
+    "unstimulated",
+    "unstim",
+    "utx",
+    "mock untreated",
+    "n a",
+    "na",
+    "control medium",
+}
+_EXVIVO_RE = re.compile(
+    r"\blps\b|il[\s\-]?\d+|tnf|ifn|pma|ionomycin|anti[\s\-]?cd3|cd3/cd28|cpg|poly\s*\(?i:c|"
+    r"stimulat|inhibitor|agonist|antagonist|sirna|shrna|knock ?down|dmso|vehicle|"
+    r"poly\s*\(?\s*i\s*:\s*c\)?|"
+    r"\d+\s*(?:ng|ug|µg|μg)/ml|\d+\s*(?:nm|um|µm|μm|mm)\b|\bst\d{3,}\b",
+    re.I,
+)
 
 _NEGATED_DISEASE = re.compile(
     r"\b(?:no|without|free of)\s+(?:disease|diseased|lesion|pathology)\b"
@@ -90,6 +151,11 @@ def infer_group_label(
     return map_traits_to_group(traits, required_groups or ["lesion", "control"], control_type)
 
 
+_GENERIC_CASE_RE = re.compile(
+    r"^(?:diseased?|affected)(?:\s*(?:group|sample|tissue)?\s*\d*[a-z]?)$"
+)
+
+
 def parse_sample_traits(sample: dict[str, Any], *, spec: ResearchSpec | None = None) -> SampleTraits:
     acc = SampleTraits()
     texts: list[tuple[str, str]] = []
@@ -112,26 +178,45 @@ def parse_sample_traits(sample: dict[str, Any], *, spec: ResearchSpec | None = N
     terms = [t.term for t in lexicon_terms("disease", spec.disease)] + spec.disease if spec is not None else []
     aliases = [alias for disease in (spec.disease if spec else []) for name, labels in DISEASE_LABELS.items()
                if disease.casefold() == name.casefold() for alias in labels]
+    disease_controls = {
+        _fold(label)
+        for disease in (spec.disease if spec else [])
+        for name, labels in DISEASE_CONTROL_LABELS.items()
+        if disease.casefold() == name.casefold()
+        for label in labels
+    }
     for key, text in texts:
         folded = _fold(text)
         if not folded or _AMBIGUOUS.match(folded):
             continue
         piece = _traits_from_text(folded)
+        grouped = _is_group_key(key)
         if spec is not None and spec.disease:
             if key in {"genotype", "treatment"}:
                 piece.pop("health", None)
                 piece.pop("control_token", None)
-            targets = terms + [a for a in aliases if key in GROUP_KEYS or len(_fold(a)) >= 5]
-            matches = [term for term in targets if _has_word(folded, term)]
-            negated = any(re.search(r"\b(?:no|without|non)\s+" + re.escape(_fold(term)) + r"\b", folded) for term in matches)
-            if matches:
-                piece["disease_state"] = "absent" if negated else "lesion"
-            elif piece.get("disease_state") == "lesion":
-                explicit = any(_has_word(folded, token) for token in ("lesion", "case", "disease", "diseased", "病例", "病变"))
-                if not explicit:
-                    piece.pop("disease_state", None)
-            if key in GROUP_KEYS and folded in {"hc", "ctrl", "con", "healthy control", "non diabetic", "uninfected"}:
+            if grouped and folded in disease_controls:
                 piece.update(control_token=True, disease_state="absent")
+            else:
+                targets = terms + [a for a in aliases if grouped or len(_fold(a)) >= 5]
+                matches = [term for term in targets if _has_word(folded, term)]
+                negated = any(re.search(r"\b(?:no|without|non)\s+" + re.escape(_fold(term)) + r"\b", folded) for term in matches)
+                if matches:
+                    piece["disease_state"] = "absent" if negated else "lesion"
+                elif piece.get("disease_state") == "lesion":
+                    # "disease" also appears inside other diseases' names ("Parkinson's disease dementia"),
+                    # so it only counts as a bare label; role words like lesion/case count anywhere.
+                    role = any(_has_word(folded, token) for token in ("lesion", "lesional", "case", "病例", "病变"))
+                    if not role and not _GENERIC_CASE_RE.match(folded):
+                        piece.pop("disease_state", None)
+            if grouped and folded in _CONTROL_EXACT:
+                piece.update(control_token=True, disease_state="absent")
+        if _is_treatment_key(key):
+            kind = _treatment_kind(text)
+            if kind:
+                piece["treatment"] = kind
+            elif folded not in {"treated", "untreated"}:
+                acc.notes.append(f"患者治疗字段：{text}")
         _merge_trait_piece(acc, piece, text)
     return acc
 
@@ -147,8 +232,12 @@ def map_traits_to_group(
     if set(groups) <= TREATMENT_GROUP_NAMES and groups:
         if traits.disease_state != "lesion":
             return None
-        if traits.treatment in groups:
-            return traits.treatment
+        label = "treated" if traits.treatment == "ex_vivo" else traits.treatment
+        if label in groups:
+            return label
+        return None
+    wants_treatment = any(g in TREATMENT_GROUP_NAMES for g in groups)
+    if traits.treatment == "ex_vivo" and not wants_treatment:
         return None
     lesion_name = next((g for g in groups if g in LESION_GROUP_NAMES), None)
     control_name = next((g for g in groups if g in CONTROL_GROUP_NAMES or g == "control"), None)
@@ -244,6 +333,27 @@ def _merge_trait_piece(acc: SampleTraits, piece: dict[str, Any], raw: str) -> No
         acc.notes.append(acc.conflict)
 
 
+def _is_group_key(key: str) -> bool:
+    folded = key.strip().lower()
+    return folded in GROUP_KEYS or any(part in folded for part in _GROUP_KEY_PARTS)
+
+
+def _is_treatment_key(key: str) -> bool:
+    folded = key.strip().lower()
+    return folded in _TREATMENT_KEYS or "treat" in folded or "stimul" in folded
+
+
+def _treatment_kind(value: str) -> str | None:
+    folded = _fold(value)
+    if folded in _BASELINE_TREATMENT:
+        return "untreated"
+    if re.search(r"therap|dmard|medication|clinical", value, re.I):
+        return None
+    if _EXVIVO_RE.search(value):
+        return "ex_vivo"
+    return None
+
+
 def _fold(value: str) -> str:
     return re.sub(r"[\s\-_/,]+", " ", value.lower()).strip()
 
@@ -298,7 +408,7 @@ def donors_per_group(
         if not donor:
             missing_donor = True
             continue
-        traits = parse_sample_traits(sample)
+        traits = parse_sample_traits(sample, spec=spec)
         if traits.conflict:
             conflicts += 1
             missing_group = True

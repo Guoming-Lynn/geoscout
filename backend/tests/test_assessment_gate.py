@@ -369,7 +369,7 @@ def test_judge_payload_strips_sample_evidence():
 def test_fit_samples_records_incomplete_coverage():
     from app.pipeline.assessment import fit_samples
 
-    samples = [{"gsm": f"GSM{i}", "title": "x" * 80, "characteristics": []} for i in range(6)]
+    samples = [{"gsm": f"GSM{i}", "title": "x" * 80, "characteristics": [{"key": "batch", "value": f"b{i}", "raw": f"batch: b{i}"}]} for i in range(6)]
     included, coverage = fit_samples(samples, budget=500)
     assert coverage["total"] == 6
     assert 0 < coverage["included"] < 6

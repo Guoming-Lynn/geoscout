@@ -14,6 +14,7 @@ AssayType = Literal[
     "proteomics",
     "epigenomics",
     "microbiome",
+    "small_rna",
 ]
 AssayMethod = Literal["ATAC-seq", "ChIP-seq", "methylation", "Hi-C"]
 OrganismName = Literal["Homo sapiens", "Mus musculus"]
@@ -115,20 +116,22 @@ class Budget(BaseModel):
     max_runtime_s: int = 3600
     max_tokens: int = 1_000_000
     max_completion_tokens: int = 4096
+    sample_char_budget: int = 40_000
     esearch_page_size: int = 50
     summary_batch_size: int = 40
 
     @classmethod
     def preset(cls, tier: BudgetTier) -> "Budget":
         values = {
-            "low": (4, 80, 0, 600, 20000, 2048),
-            "medium": (8, 150, 6, 1800, 150000, 4096),
-            "high": (16, 400, 20, 5400, 600000, 8192),
-            "ultra": (40, 1500, 100, 21600, 4000000, 16384),
+            "low": (4, 80, 0, 600, 20000, 2048, 40_000),
+            "medium": (10, 250, 10, 3600, 400_000, 4096, 60_000),
+            "high": (16, 400, 20, 5400, 1_000_000, 8192, 100_000),
+            "ultra": (40, 1500, 100, 21600, 4_000_000, 16384, 160_000),
         }
-        queries, gse, deep, runtime, tokens, output = values[tier]
+        queries, gse, deep, runtime, tokens, output, sample_chars = values[tier]
         return cls(max_queries=queries, max_unique_gse=gse, max_deep_verify=deep,
-                   max_runtime_s=runtime, max_tokens=tokens, max_completion_tokens=output)
+                   max_runtime_s=runtime, max_tokens=tokens, max_completion_tokens=output,
+                   sample_char_budget=sample_chars)
 
     @classmethod
     def screen(cls) -> "Budget":

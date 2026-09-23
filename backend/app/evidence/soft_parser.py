@@ -224,3 +224,20 @@ def count_independent_donors(samples: Iterable[dict[str, Any]]) -> int | None:
             return None
         keys.append(key)
     return len(set(keys)) if keys else None
+
+
+_BIOSAMPLE_RE = re.compile(r"SAM[ND]\d+", re.I)
+
+
+def count_biosamples(samples: Iterable[dict[str, Any]]) -> int | None:
+    """Distinct BioSample accessions. This is an upper bound, not a donor count."""
+    ids: list[str] = []
+    for sample in samples:
+        for rel in sample.get("relations") or []:
+            match = _BIOSAMPLE_RE.search(str(rel))
+            if match:
+                ids.append(match.group(0).upper())
+                break
+    if not ids:
+        return None
+    return len(set(ids))

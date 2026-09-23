@@ -9,12 +9,17 @@ from app.pipeline.repo import load
 from app.schemas.spec import ResearchSpec
 
 _OFF_TARGET = {
-    "brain": ["blood", "pbmc", "heart", "liver", "islet", "intestine", "colon"],
-    "pancreatic islets": ["blood", "pbmc", "heart", "brain", "liver"],
-    "pbmc": ["brain", "heart", "liver", "islet", "intestine", "colon"],
-    "blood": ["brain", "heart", "liver", "islet", "intestine", "colon"],
+    "brain": ["blood", "pbmc", "heart", "liver", "islet", "intestine", "colon", "synovial", "adipose"],
+    "pancreatic islets": ["blood", "pbmc", "heart", "brain", "liver", "adipose", "synovial", "muscle"],
+    "pbmc": ["brain", "cortex", "hippocampus", "heart", "liver", "islet", "intestine", "colon", "synovial", "synovium", "adipose", "muscle"],
+    "blood": ["brain", "cortex", "hippocampus", "heart", "liver", "islet", "intestine", "colon", "synovial", "adipose"],
     "intestine": ["blood", "pbmc", "heart", "brain", "liver", "islet"],
     "colon": ["blood", "pbmc", "heart", "brain", "liver", "islet"],
+    "lung": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
+    "liver": ["blood", "pbmc", "brain", "lung", "heart", "islet"],
+    "kidney": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
+    "synovium": ["blood", "pbmc", "brain", "muscle", "adipose"],
+    "skeletal muscle": ["blood", "pbmc", "brain", "synovial", "adipose"],
 }
 _MATERIAL = ["biopsy", "biopsies", "postmortem", "tissue", "islet", "islets", "pbmc", "cortex",
              "hippocampus", "dentate", "blood draw", "patient"]
@@ -27,6 +32,7 @@ _ASSAY_REASON = {
     "proteomics": "proteomics",
     "epigenomics": "epigenomics",
     "microbiome": "microbiome",
+    "small_rna": "small_rna",
     "other": "other",
 }
 
@@ -155,6 +161,13 @@ def _assay_mismatch_penalty(
     if folded.strip() == "other" and not rna_in_text:
         delta -= 20
         reasons.append("gdstype_other")
+    if (
+        "non-coding rna profiling by high throughput sequencing" in folded
+        and "expression profiling by high throughput sequencing" not in folded
+        and re.search(r"mirna|microrna|small rna", title, re.I)
+    ):
+        delta -= 30
+        reasons.append("off_assay_small_rna_hint")
     return delta
 
 

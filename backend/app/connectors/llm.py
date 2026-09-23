@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -16,6 +17,7 @@ from app.core.usage import add_usage
 from app.schemas.spec import ModelAssessment
 
 logger = logging.getLogger("geoscout.llm")
+_NETWORK_BACKOFF_S = (2, 6)
 
 PROMPT_VERSIONS = {
     "parse_research_spec": "v1",
@@ -26,11 +28,19 @@ PROMPT_VERSIONS = {
 
 
 class LLMError(Exception):
-    def __init__(self, message: str, status_code: int | None = None, retryable: bool = False, kind: str = "output") -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        retryable: bool = False,
+        kind: str = "output",
+        maybe_billed: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
         self.kind = kind
+        self.maybe_billed = maybe_billed
         self.usage: dict[str, Any] = {}
 
 
@@ -42,6 +52,8 @@ class LLMProvider:
         self.mock = mock
         self.on_usage = on_usage
         self.before_request = before_request
+        self.billing_uncertain = False
+        self.network_retries = 0
 
     async def complete_json(
         self,
@@ -75,26 +87,37 @@ class LLMProvider:
             prompt_name=prompt_name,
             max_tokens=max_output_tokens or 4096,
         ):
-            if self.before_request:
-                self.before_request(body)
-            accounted = False
-            try:
-                data, usage = await self._post(body, allow_schema_fallback=False)
-                measured = self._measure_usage(body, usage)
-                total = add_usage(total, measured)
-                accounted = True
-                content = _message_content(data)
-                if not content.strip():
-                    raise LLMError("模型返回空 content", retryable=True)
-                return _loads_json_object(content), {**total, "source": "estimated" if total.get("estimated") else "provider"}
-            except LLMError as exc:
-                if not accounted:
-                    total = add_usage(total, self._measure_usage(body, {}))
-                exc.usage = total
-                last_error = exc
-                if exc.status_code in {401, 403} or exc.kind == "network":
-                    raise
-                continue
+            while True:
+                if self.before_request:
+                    self.before_request(body)
+                accounted = False
+                try:
+                    data, usage = await self._post(body, allow_schema_fallback=False)
+                    measured = self._measure_usage(body, usage)
+                    total = add_usage(total, measured)
+                    accounted = True
+                    content = _message_content(data)
+                    if not content.strip():
+                        raise LLMError("模型返回空 content", retryable=True)
+                    return _loads_json_object(content), {**total, "source": "estimated" if total.get("estimated") else "provider"}
+                except LLMError as exc:
+                    if not accounted:
+                        total = add_usage(total, self._measure_usage(body, {}))
+                    exc.usage = total
+                    last_error = exc
+                    if exc.kind == "network" and exc.status_code is None:
+                        if exc.maybe_billed:
+                            self.billing_uncertain = True
+                        limit = 1 if exc.maybe_billed else 2
+                        if self.network_retries < limit:
+                            delay = _NETWORK_BACKOFF_S[min(self.network_retries, len(_NETWORK_BACKOFF_S) - 1)]
+                            self.network_retries += 1
+                            await asyncio.sleep(delay)
+                            continue
+                        raise
+                    if exc.kind == "network" or exc.status_code in {401, 403}:
+                        raise
+                    break
         assert last_error is not None
         raise last_error
 
@@ -247,10 +270,22 @@ class LLMProvider:
         try:
             async with httpx.AsyncClient(timeout=self.creds.llm_timeout_s) as client:
                 response = await client.post(url, headers=headers, json=body)
+        except httpx.ConnectError as exc:
+            raise LLMError(
+                f"模型网络错误: {type(exc).__name__}: {exc}", retryable=True, kind="network", maybe_billed=False,
+            ) from exc
+        except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError) as exc:
+            raise LLMError(
+                f"模型网络错误: {type(exc).__name__}: {exc}", retryable=True, kind="network", maybe_billed=True,
+            ) from exc
         except httpx.TimeoutException as exc:
-            raise LLMError("模型请求超时", retryable=True, kind="network") from exc
+            raise LLMError(
+                f"模型网络错误: {type(exc).__name__}: {exc}", retryable=True, kind="network", maybe_billed=True,
+            ) from exc
         except httpx.HTTPError as exc:
-            raise LLMError(f"模型网络错误: {exc}", retryable=True, kind="network") from exc
+            raise LLMError(
+                f"模型网络错误: {type(exc).__name__}: {exc}", retryable=True, kind="network", maybe_billed=True,
+            ) from exc
         if response.status_code in {401, 403}:
             raise LLMError("模型认证失败，请检查 API Key 与 Base URL", status_code=response.status_code)
         if response.status_code >= 400:

@@ -9,7 +9,7 @@ from typing import Any
 from app.connectors.llm import LLMError, validate_assessment
 from app.evidence.store import quote_in_text
 from app.pipeline.assay import assay_method_relation, assay_relation, infer_sample_assay, sample_method_relation
-from app.pipeline.donors import donors_per_group, infer_group_label, _organism_ok
+from app.pipeline.donors import donors_per_group, infer_group_label, parse_sample_traits, _organism_ok
 from app.pipeline.lexicon import lexicon_terms
 from app.pipeline.source import source_kind, tissue_matches
 from app.schemas.spec import CriterionJudgement, ModelAssessment, ResearchSpec
@@ -27,6 +27,7 @@ SEX_KEYS = {"sex", "gender", "biological sex", "sex (female/male)", "donor sex"}
 
 
 SAMPLE_CHAR_BUDGET = 40_000
+COVERAGE_DEMOTION_REASON = "样本记录未完整纳入模型输入，不能据此推荐。"
 _MOUSE_TOKENS = ("murine", "mouse", "mus musculus", "小鼠")
 _HUMAN_TOKENS = ("homo sapiens", "human", "人类")
 
@@ -57,7 +58,32 @@ def _sample_evidence_ids(evidence: list[dict[str, Any]]) -> dict[str, str]:
     return by_gsm
 
 
-def _compact_sample(row: dict[str, Any], *, evidence_id: str = "") -> dict[str, Any]:
+def _protocol_refs(samples: list[dict[str, Any]]) -> dict[str, str]:
+    """Map a repeated long protocol onto one id. Short or unique protocols stay on the GSM."""
+    counts: dict[str, int] = {}
+    for row in samples:
+        proto = str(row.get("protocol") or "").strip()
+        if len(proto) < 80:
+            continue
+        counts[proto] = counts.get(proto, 0) + 1
+    refs: dict[str, str] = {}
+    number = 1
+    for proto, count in counts.items():
+        if count < 2:
+            continue
+        refs[proto] = f"P{number}"
+        number += 1
+    return refs
+
+
+def _compact_sample(
+    row: dict[str, Any],
+    *,
+    evidence_id: str = "",
+    protocol_refs: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    proto = str(row.get("protocol") or "").strip()
+    ref = (protocol_refs or {}).get(proto)
     compact = {
         "gsm": row.get("gsm") or "",
         "title": row.get("title") or "",
@@ -67,13 +93,91 @@ def _compact_sample(row: dict[str, Any], *, evidence_id: str = "") -> dict[str, 
         "group_label": row.get("group_label"),
         "library_strategy": row.get("library_strategy") or "",
         "library_source": row.get("library_source") or "",
-        "protocol": row.get("protocol") or "",
         "characteristics": [str(c.get("raw") or f"{c.get('key', '')}: {c.get('value', '')}")
                             if isinstance(c, dict) else str(c) for c in row.get("characteristics") or []],
     }
+    if ref:
+        compact["protocol_id"] = ref
+    elif proto:
+        compact["protocol"] = proto
     if evidence_id:
         compact["evidence_id"] = evidence_id
     return compact
+
+
+def _sample_signature(row: dict[str, Any], label: str | None, protocol_refs: dict[str, str]) -> tuple:
+    proto = str(row.get("protocol") or "").strip()
+    protocol_key = protocol_refs.get(proto) or proto
+    chars = tuple(sorted(
+        str(item.get("raw") or "")
+        for item in (row.get("characteristics") or [])
+        if isinstance(item, dict)
+    ))
+    return (
+        label or "",
+        str(row.get("donor_key") or ""),
+        str(row.get("organism") or ""),
+        str(row.get("library_strategy") or ""),
+        str(row.get("library_source") or ""),
+        str(row.get("source_name") or ""),
+        re.sub(r"\d+", "#", str(row.get("title") or "")),
+        chars,
+        protocol_key,
+    )
+
+
+def _gsm_member_field(gsms: list[str]) -> list[str]:
+    """Full GSM list, or contiguous ranges once the list would dominate the prompt."""
+    if len(gsms) <= 8:
+        return gsms
+    numbers: list[int] = []
+    for gsm in gsms:
+        match = re.fullmatch(r"GSM(\d+)", gsm.upper())
+        if not match:
+            return gsms[:200]
+        numbers.append(int(match.group(1)))
+    ordered = sorted(set(numbers))
+    ranges: list[str] = []
+    start = previous = ordered[0]
+    for number in ordered[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append(f"GSM{start}" if start == previous else f"GSM{start}-GSM{previous}")
+        start = previous = number
+    ranges.append(f"GSM{start}" if start == previous else f"GSM{start}-GSM{previous}")
+    return ranges
+
+
+def _fold_homogeneous(
+    samples: list[dict[str, Any]],
+    *,
+    spec: ResearchSpec | None,
+    protocol_refs: dict[str, str],
+) -> tuple[list[tuple[dict[str, Any], str | None]], dict[str, list[str]]]:
+    grouped: dict[tuple, list[tuple[dict[str, Any], str | None]]] = defaultdict(list)
+    order: list[tuple] = []
+    for row in samples:
+        label = infer_group_label(row, spec=spec) if spec is not None else row.get("group_label")
+        signature = _sample_signature(row, str(label) if label else None, protocol_refs)
+        if signature not in grouped:
+            order.append(signature)
+        grouped[signature].append((row, label))
+    folded: list[tuple[dict[str, Any], str | None]] = []
+    members: dict[str, list[str]] = {}
+    for signature in order:
+        group = grouped[signature]
+        if len(group) < 3:
+            folded.extend(group)
+            continue
+        representative, label = group[0]
+        clone = dict(representative)
+        member_gsms = [str(row.get("gsm") or "") for row, _label in group if row.get("gsm")]
+        clone["_member_gsms"] = member_gsms
+        folded.append((clone, label))
+        if member_gsms:
+            members[member_gsms[0].upper()] = member_gsms
+    return folded, members
 
 
 def fit_samples(
@@ -85,11 +189,12 @@ def fit_samples(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Interleave groups within the byte budget; never truncate a sample record."""
     ids = _sample_evidence_ids(evidence or [])
+    protocol_refs = _protocol_refs(samples)
+    folded, members = _fold_homogeneous(samples, spec=spec, protocol_refs=protocol_refs)
     included: list[dict[str, Any]] = []
     used = 2
     buckets = defaultdict(deque)
-    for row in samples:
-        label = infer_group_label(row, spec=spec) if spec is not None else row.get("group_label")
+    for row, label in folded:
         key = (label or "unknown", str(row.get("organism") or ""), str(row.get("library_strategy") or ""))
         buckets[key].append((row, label))
     ordered = []
@@ -98,21 +203,34 @@ def fit_samples(
             ordered.append(buckets[key].popleft())
             if not buckets[key]:
                 del buckets[key]
+    represented_rows = 0
     for row, label in ordered:
         gsm = str(row.get("gsm") or "").upper()
-        compact = _compact_sample(row, evidence_id=ids.get(gsm, ""))
+        compact = _compact_sample(row, evidence_id=ids.get(gsm, ""), protocol_refs=protocol_refs)
         compact["group_label"] = label
+        member_gsms = [str(item) for item in row.get("_member_gsms") or [] if item]
+        if member_gsms:
+            compact["member_gsms"] = _gsm_member_field(member_gsms)
+            compact["member_count"] = len(member_gsms)
+            compact["titles_vary"] = len({str(item.get("title") or "") for item in samples if str(item.get("gsm") or "") in set(member_gsms)}) > 1
         size = len(json.dumps(compact, ensure_ascii=False)) + (2 if included else 0)
         if used + size > budget:
             continue
         included.append(compact)
+        represented_rows += len(member_gsms) or 1
         used += size
     total = len(samples)
-    return included, {
+    shared = {ref: proto for proto, ref in protocol_refs.items()}
+    coverage = {
         "total": total,
         "included": len(included),
-        "complete": len(included) == total and not any(s.get("coverage_incomplete") for s in samples),
+        "represented": represented_rows,
+        "complete": represented_rows == total and not any(s.get("coverage_incomplete") for s in samples),
+        "shared_protocols": shared,
     }
+    if members:
+        coverage["members"] = {key: value for key, value in members.items() if key in {str(row.get("gsm") or "").upper() for row in included}}
+    return included, coverage
 
 
 def study_evidence_only(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -126,11 +244,15 @@ def judge_user_payload(
     summary: dict[str, Any],
     evidence: list[dict[str, Any]],
     samples: list[dict[str, Any]],
+    budget: int = SAMPLE_CHAR_BUDGET,
 ) -> dict[str, Any]:
     """Payload for assess/verify. Sample records live in samples[]; evidence is study-level only."""
-    included, coverage = fit_samples(samples, evidence=evidence, spec=spec)
+    included, coverage = fit_samples(samples, evidence=evidence, spec=spec, budget=budget)
+    shared = coverage.pop("shared_protocols", {})
+    coverage.pop("members", None)
+    coverage.pop("represented", None)
     group_counts = Counter(infer_group_label(s, spec=spec) or "unknown" for s in samples)
-    return {
+    payload = {
         "gse": gse,
         "sample_records_available": bool(samples),
         "sample_coverage": coverage,
@@ -140,7 +262,7 @@ def judge_user_payload(
             for g in spec.required_groups
         },
         "group_inventory": {"gsm_counts": dict(group_counts), "source_records_complete": not any(s.get("coverage_incomplete") for s in samples),
-                            "note": "Derived grouping of all downloaded GSM records, not donor counts or eligibility proof; unknown labels are retained."},
+                            "note": "Derived grouping of all downloaded GSM records, not donor counts or eligibility proof; unknown labels are retained. 折叠记录代表 member_gsms 中的全部样本，字段完全相同；qualifying_gsms 写代表 GSM 即可。"},
         "spec": spec.model_dump(),
         "summary": {
             "title": summary.get("title") or "",
@@ -153,6 +275,10 @@ def judge_user_payload(
         "samples": included,
         "evidence": study_evidence_only(evidence),
     }
+    if shared:
+        payload["shared_protocols"] = shared
+        payload["shared_protocols_note"] = "相同的 protocol 只附一次。样本里的 protocol_id 指向 shared_protocols。"
+    return payload
 
 
 @dataclass
@@ -201,7 +327,10 @@ def check_model_assessment(
             _demote_study_level_fail(item, evidence, samples)
             _demote_source_conflict(item, evidence, study)
             criterion = next(c for c in spec.inclusion_criteria if c.criterion_id == cid)
-            _bind_qualifying_gsms(item, spec, criterion, samples, study=study)
+            _bind_qualifying_gsms(
+                item, spec, criterion, samples, study=study,
+                members=(sample_coverage or {}).get("members"),
+            )
             _guard_subset_failure(item, spec, samples, study, sample_coverage)
             by_id[cid] = item
     except LLMError as exc:
@@ -377,7 +506,7 @@ def _demote_incomplete_sample_coverage(
             continue
         item.verdict = "unknown"
         item.clue_only = True
-        item.reason = "样本记录未完整纳入模型输入，不能据此推荐。"
+        item.reason = COVERAGE_DEMOTION_REASON
 
 
 def _guard_subset_failure(
@@ -429,14 +558,48 @@ def _guard_subset_failure(
         item.reason = "现有证据未排除目标样本子集，或样本覆盖不完整；不能把研究整体排除。原判断：" + item.reason
 
 
+def _expand_gsm_token(token: str, members: dict[str, list[str]], known: set[str]) -> list[str]:
+    raw = str(token).strip()
+    upper = raw.upper()
+    if upper in members:
+        return members[upper]
+    match = re.fullmatch(r"GSM(\d+)\s*-\s*GSM(\d+)", upper)
+    if match:
+        start, end = int(match.group(1)), int(match.group(2))
+        if 0 <= end - start <= 5000:
+            found = [f"GSM{number}" for number in range(start, end + 1) if f"GSM{number}" in known]
+            if found:
+                return found
+    return [raw]
+
+
+def _expand_listed_gsms(gsms: list[str], members: dict[str, list[str]] | None, known: set[str]) -> list[str]:
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for token in gsms:
+        for gsm in _expand_gsm_token(token, members or {}, known):
+            key = gsm.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append(gsm)
+    return expanded
+
+
 def _bind_qualifying_gsms(
     item: CriterionJudgement,
     spec: ResearchSpec,
     criterion,
     samples: list[dict[str, Any]] | None,
     study: dict[str, Any] | None = None,
+    members: dict[str, list[str]] | None = None,
 ) -> None:
-    gsms = [str(g).strip() for g in item.qualifying_gsms if str(g).strip()]
+    known = {str(sample.get("gsm") or "").upper() for sample in (samples or []) if sample.get("gsm")}
+    gsms = _expand_listed_gsms(
+        [str(g).strip() for g in item.qualifying_gsms if str(g).strip()],
+        members,
+        known,
+    )
     if not gsms:
         return
     if not samples:
@@ -457,8 +620,13 @@ def _bind_qualifying_gsms(
                 raise LLMError(f"{gsm} 与要求的物种子集不一致")
         if field in {"groups", "donors"} and spec.required_groups:
             label = infer_group_label(sample, spec=spec)
-            if label not in {g.lower() for g in spec.required_groups}:
-                raise LLMError(f"{gsm} 的分组 {label or '未知'} 与条件不一致")
+            needed = {g.lower() for g in spec.required_groups}
+            if not label:
+                insufficient.append(gsm)
+                continue
+            if label not in needed:
+                contradict.append(gsm)
+                continue
         if field == "assay" and spec.assay_types:
             call = infer_sample_assay(sample, study)
             rel = assay_relation(list(spec.assay_types), call)
@@ -500,6 +668,17 @@ def _bind_qualifying_gsms(
         if contradict or insufficient:
             item.reason = (item.reason or "") + " 仅保留技术匹配的子集：" + ",".join(kept)
         return
+    if field in {"groups", "donors"} and spec.required_groups and (contradict or insufficient):
+        if not kept:
+            item.verdict = "unknown"
+            item.clue_only = True
+            item.qualifying_gsms = []
+            if contradict and not insufficient:
+                item.reason = "列出的 GSM 被规则判定为其他分组，已从符合集合移除。"
+            else:
+                item.reason = "列出的 GSM 缺少可核对的分组标签，已从符合集合移除。"
+            return
+        item.reason = (item.reason or "") + " 已移除分组对不上的 GSM：" + ",".join(contradict + insufficient)
     if field in {"groups", "donors"} and spec.required_groups:
         labels = {infer_group_label(by_gsm[g.upper()], spec=spec) for g in kept}
         needed = {g.lower() for g in spec.required_groups}
@@ -858,6 +1037,17 @@ def merge_final(
             else:
                 merged.append(chosen)
             continue
+        if _rule_covers_truncated_model(criterion, rule, f_item, v_item, samples, spec):
+            merged.append(
+                rule.model_copy(
+                    update={
+                        "judge_source": "rule_full_coverage",
+                        "reason": (rule.reason or "")
+                        + f" 模型只看到部分样本；规则已在全部 {len(samples or [])} 条样本上核对。",
+                    }
+                )
+            )
+            continue
         if _rule_standalone(rule):
             merged.append(rule)
             continue
@@ -877,6 +1067,43 @@ def merge_final(
     for item in merged:
         _guard_subset_failure(item, spec, samples, study)
     return merged, conflicts, review_complete, model_invalid
+
+
+def _demoted_for_coverage(item: CriterionJudgement | None) -> bool:
+    return item is not None and item.verdict == "unknown" and (item.reason or "").startswith(COVERAGE_DEMOTION_REASON)
+
+
+def _rule_covers_truncated_model(
+    criterion,
+    rule: CriterionJudgement,
+    first: CriterionJudgement | None,
+    verify: CriterionJudgement | None,
+    samples: list[dict[str, Any]] | None,
+    spec: ResearchSpec,
+) -> bool:
+    """Use a full-sample rule pass when both model calls were downgraded only for truncation."""
+    if criterion.field not in {"assay", "groups"}:
+        return False
+    if not (_demoted_for_coverage(first) and _demoted_for_coverage(verify)):
+        return False
+    if rule.verdict != "pass" or rule.clue_only or not rule.qualifying_gsms or not rule.support_text:
+        return False
+    if criterion.field != "groups":
+        return True
+    needed = {group.lower() for group in spec.required_groups}
+    by_gsm = {str(sample.get("gsm") or "").upper(): sample for sample in (samples or []) if sample.get("gsm")}
+    labels = {
+        infer_group_label(by_gsm[gsm.upper()], spec=spec)
+        for gsm in rule.qualifying_gsms
+        if gsm.upper() in by_gsm
+    }
+    if not needed or not needed.issubset({label for label in labels if label}):
+        return False
+    return all(
+        parse_sample_traits(by_gsm[gsm.upper()], spec=spec).treatment != "ex_vivo"
+        for gsm in rule.qualifying_gsms
+        if gsm.upper() in by_gsm
+    )
 
 
 def _rule_standalone(rule: CriterionJudgement) -> bool:

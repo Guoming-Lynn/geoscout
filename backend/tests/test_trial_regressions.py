@@ -31,7 +31,9 @@ def test_two_models_cannot_exclude_mixed_study(field):
     first = check_model_assessment(spec, raw, evidence, samples, study)
     second = check_model_assessment(spec, raw, evidence, samples, study)
     final, _, _, _ = merge_final(spec, rule_judgements(spec, study, samples), first, second, samples, study)
-    assert next(j for j in final if j.criterion_id == field).verdict == "unknown"
+    verdict = next(j for j in final if j.criterion_id == field).verdict
+    # Both samples are RNA-seq, so the sample-level assay rule can pass that subset.
+    assert verdict == ("pass" if field == "assay" else "unknown")
 
 
 def test_pure_wrong_species_still_excluded():

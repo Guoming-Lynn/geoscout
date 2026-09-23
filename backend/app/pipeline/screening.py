@@ -194,6 +194,9 @@ def _gdstype_text(summary: dict[str, Any]) -> str:
 
 def _assay(criterion: Criterion, summary: dict[str, Any], samples: list[dict[str, Any]], text: str) -> CriterionJudgement:
     wanted = _as_str_list(criterion.value)
+    sample_call = _assay_from_samples(criterion, summary, samples, wanted)
+    if sample_call is not None:
+        return sample_call
     gdstype = _gdstype_text(summary)
     blob = text.lower()
     has_scrna = any(h.lower() in blob for h in SCRNA_HINTS)
@@ -337,6 +340,68 @@ def _assay(criterion: Criterion, summary: dict[str, Any], samples: list[dict[str
             )
         return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="unknown", reason="不能确认 bulk RNA-seq。", judge_source="rule")
     return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="unknown", reason="未指定可判定技术。", judge_source="rule")
+
+
+def _assay_from_samples(
+    criterion: Criterion,
+    summary: dict[str, Any],
+    samples: list[dict[str, Any]],
+    wanted: list[str],
+) -> CriterionJudgement | None:
+    """Prefer per-GSM library evidence over the series technology label."""
+    labeled = [sample for sample in samples if sample.get("gsm")]
+    if not labeled or not wanted:
+        return None
+    ok: list[str] = []
+    bad: list[str] = []
+    insufficient = False
+    for sample in labeled:
+        relation = assay_relation(wanted, infer_sample_assay(sample, summary))
+        gsm = str(sample.get("gsm") or "")
+        if relation == "ok":
+            ok.append(gsm)
+        elif relation == "contradict":
+            bad.append(gsm)
+        else:
+            insufficient = True
+    if ok:
+        strategies = sorted({str(sample.get("library_strategy") or "") for sample in labeled if str(sample.get("gsm") or "") in set(ok)} - {""})
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="pass",
+            reason=f"{len(ok)}/{len(labeled)} 条样本的技术与要求一致。",
+            judge_source="rule",
+            support_text=", ".join(strategies) or ",".join(wanted),
+            qualifying_gsms=ok,
+        )
+    if bad and len(bad) == len(labeled):
+        shown = sorted({infer_sample_assay(sample, summary).kind or "other" for sample in labeled})
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="fail",
+            reason=f"全部 {len(labeled)} 条样本技术为 {'、'.join(shown)}，与要求 {','.join(wanted)} 冲突。",
+            judge_source="rule",
+            support_text=str(labeled[0].get("library_strategy") or ""),
+        )
+    return None
+
+
+_GATE_FIELDS = {"organism", "assay", "assay_method", "tissue", "sample_source"}
+
+
+def rule_gate_ids(spec: ResearchSpec, summary: dict[str, Any], samples: list[dict[str, Any]] | None) -> list[str]:
+    """Hard sample-level rule failures that can skip the model. Empty without samples."""
+    if not samples:
+        return []
+    by_id = {item.criterion_id: item for item in spec.inclusion_criteria}
+    failed: list[str] = []
+    for judgement in rule_judgements(spec, summary, samples):
+        criterion = by_id.get(judgement.criterion_id)
+        if criterion is None or criterion.priority != "hard" or criterion.field not in _GATE_FIELDS:
+            continue
+        if judgement.verdict == "fail" and not judgement.clue_only and (judgement.qualifying_gsms or judgement.support_text):
+            failed.append(judgement.criterion_id)
+    return failed
 
 
 def _assay_method(

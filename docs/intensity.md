@@ -4,15 +4,15 @@ The workbench can override the deep-review count while preserving the selected t
 
 Sample source is an optional hard constraint (direct primary samples, cell line/iPSC, organoid, xenograft). Tissue matching can separately be required. Defaults preserve old topics. Unknown provenance remains unknown; human/patient-derived alone does not prove primary collection. Primary includes directly collected control samples as well as patient samples; disease/control criteria determine the groups. Model parsing cannot silently add these restrictions. Use the structured editor for sources that the conservative parser does not recognize.
 
-Sample payloads have a shared 40,000-character cap for deep assessment at all tiers. Compact raw characteristics avoid duplicated text, and records alternate across derived group/species/assay buckets. Oversized records are omitted whole; any omitted record keeps sample coverage incomplete. This cap is separate from tokens and does not guarantee all samples fit. Generic disease/control topics use case/control groups. Derived group inventories count GSM records, never independent donors, and do not replace original sample evidence.
+Sample payloads are capped per tier (Low 40,000 characters, Medium 60,000, High 100,000, Ultra 160,000). Records with the same group, donor, assay and characteristics are folded before packing, and records alternate across derived group/species/assay buckets. An omitted record keeps sample coverage incomplete. This cap is separate from tokens and does not guarantee all samples fit. Generic disease/control topics use case/control groups. Derived group inventories count GSM records, never independent donors, and do not replace original sample evidence.
 
 The UI defaults to medium. Limits are maxima, not promised coverage or costs.
 
 | Tier | Queries | Unique GSE | SOFT/deep targets | Tokens | Runtime |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Low | 4 | 80 | 0 | 20,000 | 10 minutes |
-| Medium | 8 | 150 | 6 | 150,000 | 30 minutes |
-| High | 16 | 400 | 20 | 600,000 | 90 minutes |
+| Medium | 10 | 250 | 10 | 400,000 | 60 minutes |
+| High | 16 | 400 | 20 | 1,000,000 | 90 minutes |
 | Ultra | 40 | 1,500 | 100 | 4,000,000 | 6 hours |
 
 Ultra increases retrieval and evidence-review budgets. It does not switch models or enable provider thinking mode. Current DeepSeek JSON requests disable thinking. Independent first assessment and review are used for deep targets at every tier; missing evidence still prevents recommendation.

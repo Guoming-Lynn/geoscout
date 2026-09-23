@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.connectors.geo_ftp import GeoFetchError, GeoFtpClient
+from app.connectors.geo_ftp import GeoFetchError, GeoFtpClient, classify_suppl_names
 from app.connectors.llm import LLMError, LLMProvider
 from app.connectors.ncbi import NCBIClient, NCBIError, gse_from_summary, public_summary
 from app.core.config import settings
@@ -20,8 +21,9 @@ from app.core.credentials import SessionCredentials, store
 from app.core.usage import add_usage
 from app.core.urls import accession_page
 from app.db.models import Assessment, Dataset, DatasetRelation, Job, Override, QueryAttempt, Run, RunDataset, Sample
-from app.evidence.soft_parser import count_independent_donors, parse_soft_bytes, series_as_dict
+from app.evidence.soft_parser import count_biosamples, count_independent_donors, parse_soft_bytes, series_as_dict
 from app.evidence.store import add_evidence, evidence_bundle, new_id, write_snapshot
+from app.pipeline.assay import mixed_omics_note
 from app.pipeline.assessment import (
     CheckedAssessment,
     bind_rule_evidence,
@@ -44,7 +46,7 @@ from app.pipeline.repo import (
     upsert_run_dataset,
     upsert_sample,
 )
-from app.pipeline.screening import classify, rule_judgements, soft_score
+from app.pipeline.screening import classify, rule_gate_ids, rule_judgements, soft_score
 from app.pipeline.spec_parse import heuristic_parse, merge_model_parse
 from app.prompts import load_prompt
 from app.schemas.spec import Budget, CriterionJudgement, ResearchSpec, TermEntry
@@ -189,6 +191,9 @@ class Engine:
         expected = estimate_tokens(json.dumps(body.get("messages", []), ensure_ascii=False)) + int(body.get("max_tokens") or 0)
         if used + expected > self._budget(run).max_tokens:
             raise BudgetStop("剩余 token 预算不足以容纳下一次请求（预估输入及输出额度）", unfinished="llm")
+
+    def _sample_budget(self, run: Run) -> int:
+        return int(getattr(self._budget(run), "sample_char_budget", 40_000) or 40_000)
 
     def _guard(self, run: Run, next_action: str, *, reserve: int = 0) -> None:
         check_before_external(run, self._budget(run), next_action=next_action, reserve=reserve)
@@ -484,7 +489,9 @@ class Engine:
         if "deep_targets" not in checkpoint:
             datasets = (await self.session.execute(select(Dataset).join(RunDataset, RunDataset.gse == Dataset.gse).where(RunDataset.run_id == run.id))).scalars().all()
             summaries = {d.gse: _screen_summary(d) for d in datasets}
-            checkpoint["deep_targets"] = select_deep_targets(rows, summaries, budget.max_deep_verify)
+            cap = budget.max_deep_verify
+            extra = 0 if cap <= 0 else max(2, cap // 2)
+            checkpoint["deep_targets"] = select_deep_targets(rows, summaries, cap + extra)
             for row in rows:
                 first = load(row.first_assess_json, {})
                 selection = first.setdefault("selection", {})
@@ -497,15 +504,18 @@ class Engine:
         targets = [by_gse[g] for g in checkpoint["deep_targets"] if g in by_gse]
         payload = load(self.job.payload_json, {})
         index = int(payload.get("index") or 0)
-        if index >= len(targets):
-            skipped = max(0, len(rows) - len(targets))
-            await bump_counters(self.session, run, deep_skipped=skipped)
+        deep_done = int(load(run.counters_json, {}).get("deep_done") or 0)
+        if index >= len(targets) or (budget.max_deep_verify > 0 and deep_done >= budget.max_deep_verify):
+            unfetched = max(0, len(targets) - index)
+            not_selected = max(0, len(rows) - len(targets))
+            await bump_counters(self.session, run, deep_skipped=unfetched + not_selected)
             self.job.status = "done"
             await enqueue_job(self.session, run.id, "assess")
             return
-        self._guard(run, "deep")
+        self._guard(run, "soft")
         rd = targets[index]
         try:
+            client: GeoFtpClient | None = None
             if settings.ncbi_mode == "mock" or self._demo(run):
                 fixture = _soft_fixture(rd.gse)
                 data = fixture.read_bytes()
@@ -523,7 +533,9 @@ class Engine:
                 await upsert_sample(self.session, rd.gse, sample, truncated=bool(parsed.get("truncated")))
             rd.gsm_count = len(samples) if not parsed.get("truncated") else rd.gsm_count
             rd.independent_donors = count_independent_donors(samples)
-            rd.biosample_count = len(samples) or None
+            rd.biosample_count = count_biosamples(samples)
+            if client is not None:
+                await self._record_suppl(rd, client)
             rd.donors_per_group_json = dump(
                 donors_per_group(
                     samples,
@@ -534,7 +546,6 @@ class Engine:
                     spec=spec,
                 )
             )
-            await bump_counters(self.session, run, deep_done=1)
             for rel in parsed.get("relations") or []:
                 self.session.add(
                     DatasetRelation(
@@ -567,12 +578,69 @@ class Engine:
                     text=record,
                 )
             await add_event(self.session, run.id, f"{rd.gse} SOFT 元数据已解析，样本 {len(samples)}，截断={parsed.get('truncated')}")
+            ds = await self.session.get(Dataset, rd.gse)
+            study = load(ds.summary_json, {}) if ds else {}
+            gate_summary = _gate_summary(study, parsed)
+            failed = [] if parsed.get("truncated") else rule_gate_ids(spec, gate_summary, samples)
+            if failed:
+                evidence = await evidence_bundle(self.session, run.id, rd.gse)
+                rules = bind_rule_evidence(rule_judgements(spec, gate_summary, samples), evidence)
+                await self._mark_rule_gate(run, rd, rules, failed)
+                await bump_counters(self.session, run, deep_gated=1)
+            else:
+                await bump_counters(self.session, run, deep_done=1)
         except GeoFetchError as exc:
             rd.verification_status = "soft_failed"
             rd.concerns = str(exc)
+            rd.reason = f"深核选中但 GEO SOFT 下载失败（{exc}），未完成样本核验，建议稍后重跑。"
             await add_event(self.session, run.id, f"{rd.gse} SOFT 获取失败: {exc}", level="warn")
         self.job.status = "done"
         await enqueue_job(self.session, run.id, "deep_fetch", {"index": index + 1})
+
+    async def _note_network_retries(self, run: Run, gse: str, llm: LLMProvider) -> None:
+        count = int(getattr(llm, "network_retries", 0) or 0)
+        reported = int(getattr(llm, "_retries_reported", 0) or 0)
+        for number in range(reported + 1, count + 1):
+            await add_event(self.session, run.id, f"{gse} 模型网络错误，第 {number} 次重试")
+        llm._retries_reported = count
+
+    async def _mark_rule_gate(self, run: Run, rd: RunDataset, rules: list[CriterionJudgement], failed: list[str]) -> None:
+        prior = load(rd.first_assess_json, {})
+        rd.category = "excluded"
+        rd.reason = "硬条件失败（样本级规则，未调用模型）: " + ",".join(failed)
+        rd.verification_status = "verified"
+        rd.model_output_invalid = False
+        rd.first_assess_json = dump(
+            {
+                "selection": prior.get("selection", {}),
+                "rules": [item.model_dump() for item in rules],
+                "model": None,
+                "model_invalid": False,
+                "model_incomplete": False,
+                "rule_gate": True,
+            }
+        )
+        await _replace_assessments(self.session, run.id, rd.gse, "assess_rules", rules, actor="rule")
+        await _replace_assessments(self.session, run.id, rd.gse, "final", rules, actor="rule")
+        await add_event(self.session, run.id, f"{rd.gse} 样本级规则已排除，跳过模型调用")
+
+    async def _record_suppl(self, rd: RunDataset, client: GeoFtpClient) -> None:
+        try:
+            listing = await client.list_suppl(rd.gse)
+        except Exception as exc:
+            logger.warning("suppl listing failed for %s: %s", rd.gse, exc)
+            rd.file_listing_checked = True
+            rd.matrix_availability = "unchecked"
+            return
+        rd.file_listing_checked = True
+        if listing.get("status") != "ok":
+            rd.matrix_availability = "unchecked"
+            return
+        classified = classify_suppl_names(list(listing.get("names") or []))
+        rd.matrix_availability = classified["matrix_availability"]
+        rd.processed_data = classified["processed_data"]
+        if classified["raw_data"] != "unknown":
+            rd.raw_data = classified["raw_data"]
 
     async def step_assess(self, run: Run) -> None:
         run.stage = "verifying"
@@ -592,9 +660,19 @@ class Engine:
         ds = await self.session.get(Dataset, rd.gse)
         summary = load(ds.summary_json, {}) if ds else {}
         evidence = await evidence_bundle(self.session, run.id, rd.gse)
-        _, coverage = fit_samples(sample_dicts, evidence=evidence, spec=spec)
+        _, coverage = fit_samples(sample_dicts, evidence=evidence, spec=spec, budget=self._sample_budget(run))
         truncated = any(s.get("coverage_incomplete") for s in sample_dicts) or not coverage.get("complete", True)
         rules = bind_rule_evidence(rule_judgements(spec, summary, sample_dicts, truncated=truncated), evidence)
+        failed = rule_gate_ids(spec, summary, sample_dicts)
+        if failed:
+            await self._mark_rule_gate(run, rd, rules, failed)
+            self.job.status = "done"
+            nxt = _open_review(rows)
+            if nxt is None:
+                await enqueue_job(self.session, run.id, "finalize")
+            else:
+                await enqueue_job(self.session, run.id, nxt[1], {"index": nxt[0]})
+            return
         checked: CheckedAssessment | None = None
         try:
             if await self._abandon_if_finished(run):
@@ -658,7 +736,7 @@ class Engine:
         sample_dicts = await _sample_dicts(self.session, rd.gse, spec=spec)
         ds = await self.session.get(Dataset, rd.gse)
         summary = load(ds.summary_json, {}) if ds else {}
-        _, coverage = fit_samples(sample_dicts, evidence=evidence, spec=spec)
+        _, coverage = fit_samples(sample_dicts, evidence=evidence, spec=spec, budget=self._sample_budget(run))
         truncated = any(s.get("coverage_incomplete") for s in sample_dicts) or not coverage.get("complete", True)
         verify_checked: CheckedAssessment | None = None
         stored = load(rd.verify_assess_json, {})
@@ -719,7 +797,9 @@ class Engine:
         )
         rd.model_output_invalid = rd.model_output_invalid or merge_invalid
         rd.conflict_json = dump(conflicts)
-        depth_complete = rd.verification_status in {"soft_loaded", "assessed"} and coverage.get("complete", True)
+        depth_complete = rd.verification_status in {"soft_loaded", "assessed"} and not any(
+            sample.get("coverage_incomplete") for sample in sample_dicts
+        )
         verified = depth_complete and review_complete and not conflicts and not rd.model_output_invalid
         category, reason = classify(
             spec,
@@ -736,6 +816,7 @@ class Engine:
             rd.reason = kept.reason or reason
         else:
             rd.category, rd.reason = category, reason
+        rd.reason = _annotate_reason(rd.reason, rd, summary, sample_dicts, spec=spec, merged=merged)
         score, coverage_score, _ = soft_score(spec, merged)
         if rd.category == "needs_review" and rd.concerns and rd.concerns.startswith("模型请求失败") and kept is None:
             rd.reason = rd.concerns
@@ -768,44 +849,52 @@ class Engine:
         if await self._peer_cancelled(run):
             raise StopForCancel()
         user = json.dumps(
-            judge_user_payload(spec, rd.gse, summary=summary, evidence=evidence, samples=sample_dicts),
+            judge_user_payload(
+                spec, rd.gse, summary=summary, evidence=evidence, samples=sample_dicts,
+                budget=self._sample_budget(run),
+            ),
             ensure_ascii=False,
         )
         system = load_prompt(prompt_name)
         self._guard_review(run, prompt_name, input_tokens=estimate_tokens(system) + estimate_tokens(user))
-        raw, usage = await llm.complete_json(
-            prompt_name=prompt_name,
-            system=system,
-            user=user,
-            schema=None,
-            max_output_tokens=self._budget(run).max_completion_tokens,
-        )
-        checked = check_model_assessment(
-            spec, raw, evidence, samples=sample_dicts, study=summary, sample_coverage=coverage
-        )
-        if checked.invalid and not llm.mock:
-            await add_event(self.session, run.id, f"{rd.gse} 开始格式修复")
-            try:
-                return await self._repair_assessment(
-                    run,
-                    llm,
-                    prompt_name=prompt_name,
-                    user=user,
-                    previous_raw=raw,
-                    spec=spec,
-                    evidence=evidence,
-                    sample_dicts=sample_dicts,
-                    summary=summary,
-                    coverage=coverage,
-                    gse=rd.gse,
-                )
-            except BudgetStop:
-                raise
-            except Exception as exc:
-                logger.exception("format repair failed")
-                await add_event(self.session, run.id, f"{rd.gse} 格式修复失败: {exc}", level="warn")
-                return checked
-        return checked
+        try:
+            raw, usage = await llm.complete_json(
+                prompt_name=prompt_name,
+                system=system,
+                user=user,
+                schema=None,
+                max_output_tokens=self._budget(run).max_completion_tokens,
+            )
+            checked = check_model_assessment(
+                spec, raw, evidence, samples=sample_dicts, study=summary, sample_coverage=coverage
+            )
+            if checked.invalid and not llm.mock:
+                await add_event(self.session, run.id, f"{rd.gse} 开始格式修复")
+                try:
+                    return await self._repair_assessment(
+                        run,
+                        llm,
+                        prompt_name=prompt_name,
+                        user=user,
+                        previous_raw=raw,
+                        spec=spec,
+                        evidence=evidence,
+                        sample_dicts=sample_dicts,
+                        summary=summary,
+                        coverage=coverage,
+                        gse=rd.gse,
+                    )
+                except BudgetStop:
+                    raise
+                except Exception as exc:
+                    logger.exception("format repair failed")
+                    await add_event(self.session, run.id, f"{rd.gse} 格式修复失败: {exc}", level="warn")
+                    return checked
+            return checked
+        finally:
+            await self._note_network_retries(run, rd.gse, llm)
+            if getattr(llm, "billing_uncertain", False):
+                run.duplicate_billing_risk = True
 
     async def _repair_assessment(
         self,
@@ -1053,6 +1142,161 @@ async def _sample_dicts(session: AsyncSession, gse: str, *, spec: ResearchSpec |
         for row in out:
             row["group_label"] = infer_group_label(row, spec=spec)
     return out
+
+
+def _gate_summary(study: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
+    gdstype = study.get("gdstype") or parsed.get("type") or ""
+    return {
+        **study,
+        "title": study.get("title") or parsed.get("title") or "",
+        "summary": study.get("summary") or parsed.get("summary") or "",
+        "overall_design": parsed.get("overall_design") or study.get("overall_design") or "",
+        "gdstype": gdstype,
+        "taxon": study.get("taxon") or "",
+    }
+
+
+def _title_individual_count(samples: list[dict[str, Any]]) -> int | None:
+    # One-cell-per-GSM series carry chip/well/index codes in titles, not individuals.
+    if len(samples) > 200:
+        return None
+    noise = re.compile(r"utx|lps|il-?1b|st\d+|rep\d+|r\d+$|_\d+h|(?<![A-Za-z0-9])S\d{1,3}(?![A-Za-z0-9])", re.I)
+    token = re.compile(r"[A-Za-z]{1,4}\d{1,3}")
+    found: set[str] = set()
+    for sample in samples:
+        title = noise.sub(" ", str(sample.get("title") or ""))
+        found.update(token.findall(title))
+    count = len(found)
+    if count < 2 or not samples or count > len(samples) // 2:
+        return None
+    return count
+
+
+_PEDIATRIC_RE = re.compile(
+    r"\b(?:fetal|fetus|foetal|embryo\w*|newborn|neonat\w*|infant|toddler|child\w*|juvenile|adolescen\w*|pediatric|paediatric)\b",
+    re.I,
+)
+_PERSONAL_KEYS = ("age", "sex", "gender", "bmi", "hba1c", "ethnic", "race", "pmi")
+
+
+def _char_map(sample: dict[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for row in sample.get("characteristics") or []:
+        if isinstance(row, dict) and row.get("key"):
+            out[str(row["key"]).strip().lower()] = str(row.get("value") or "").strip()
+    return out
+
+
+def _repeated_sample_note(cohort: list[dict[str, Any]]) -> str:
+    """Detect several GSMs per donor that differ only by one prep/condition field."""
+    if len(cohort) < 4 or all(s.get("donor_key") for s in cohort):
+        return ""
+    maps = [_char_map(s) for s in cohort]
+    keys = set.intersection(*(set(m) for m in maps))
+    if not any(any(p in k for p in _PERSONAL_KEYS) for k in keys):
+        return ""
+    for key in sorted(keys):
+        if any(p in key for p in _PERSONAL_KEYS) or len({m[key] for m in maps}) < 2:
+            continue
+        buckets: dict[tuple, set[str]] = {}
+        sizes: dict[tuple, int] = {}
+        for m in maps:
+            sig = tuple(sorted((k, v) for k, v in m.items() if k != key))
+            buckets.setdefault(sig, set()).add(m[key])
+            sizes[sig] = sizes.get(sig, 0) + 1
+        if len(buckets) * 2 <= len(cohort) and all(len(vals) == sizes[sig] for sig, vals in buckets.items()):
+            return f"疑似同一供体的多份样本（按“{key}”区分），估计约 {len(buckets)} 位供体，不应按 GSM 数当独立样本。"
+    return ""
+
+
+def _age_mismatch_note(cohort: list[dict[str, Any]], labels: dict[str, str]) -> str:
+    young: dict[str, int] = {}
+    total: dict[str, int] = {}
+    for sample in cohort:
+        label = labels.get(str(sample.get("gsm") or "").upper())
+        if not label:
+            continue
+        total[label] = total.get(label, 0) + 1
+        values = " ".join(v for k, v in _char_map(sample).items() if "age" in k or "stage" in k or "develop" in k)
+        if _PEDIATRIC_RE.search(values):
+            young[label] = young.get(label, 0) + 1
+    if not young or len(total) < 2 or all(young.get(g, 0) for g in total):
+        return ""
+    shown = "、".join(f"{g} {young[g]}/{total[g]}" for g in sorted(young))
+    return f"年龄段不匹配：{shown} 个 GSM 来自胎儿/儿童/青少年供体，另一组没有。"
+
+
+def _annotate_reason(
+    reason: str,
+    rd: RunDataset,
+    summary: dict[str, Any],
+    samples: list[dict[str, Any]],
+    *,
+    spec: ResearchSpec | None = None,
+    merged: list[CriterionJudgement] | None = None,
+) -> str:
+    extra: list[str] = []
+    text = reason or ""
+    note = mixed_omics_note(summary, samples)
+    if note and note not in text:
+        extra.append(note)
+    if spec is not None and merged:
+        groups = next(
+            (item for item in merged if item.criterion_id == "groups" and item.verdict == "pass" and item.qualifying_gsms),
+            None,
+        )
+        if groups is not None:
+            by_gsm = {str(sample.get("gsm") or "").upper(): sample for sample in samples}
+            counts: dict[str, int] = {}
+            donors: dict[str, set[str]] = {}
+            labels: dict[str, str] = {}
+            cohort_samples: list[dict[str, Any]] = []
+            for gsm in groups.qualifying_gsms:
+                sample = by_gsm.get(str(gsm).upper())
+                label = infer_group_label(sample, spec=spec) if sample is not None else None
+                if label:
+                    counts[label] = counts.get(label, 0) + 1
+                    labels[str(gsm).upper()] = label
+                    cohort_samples.append(sample)
+                    if sample.get("donor_key"):
+                        donors.setdefault(label, set()).add(str(sample["donor_key"]))
+            if counts:
+                ordered = sorted(counts, key=lambda label: (0 if label in {"case", "lesion", "disease"} else 1, label))
+                shown = " / ".join(f"{label} {counts[label]}" for label in ordered)
+                cohort = f"适用队列：{shown} 个 GSM。"
+                if cohort not in text:
+                    extra.append(cohort)
+                if all(sample.get("donor_key") for sample in cohort_samples):
+                    donor_text = " / ".join(f"{label} {len(donors.get(label, ()))}" for label in ordered)
+                    donor_line = f"独立供体：{donor_text}。"
+                    if donor_line not in text:
+                        extra.append(donor_line)
+                    effective = {label: len(donors.get(label, ())) for label in ordered}
+                else:
+                    effective = dict(counts)
+                for note in (_repeated_sample_note(cohort_samples), _age_mismatch_note(cohort_samples, labels)):
+                    if note and note not in text:
+                        extra.append(note)
+                if any(count < 3 for count in effective.values()):
+                    small = "每组样本很少，统计效力有限。"
+                    if small not in text:
+                        extra.append(small)
+    if rd.independent_donors is None and rd.biosample_count:
+        donor = f"独立供体字段不完整；{rd.biosample_count} 个 BioSample 只是未去重的上限。"
+        if donor not in text:
+            extra.append(donor)
+        individuals = _title_individual_count(samples)
+        if individuals:
+            hint = f"样本名提示约 {individuals} 位个体（仅供参考）。"
+            if hint not in text:
+                extra.append(hint)
+    if rd.file_listing_checked and rd.matrix_availability not in {None, "", "unknown", "unchecked"}:
+        matrix = f"补充文件检查：{rd.matrix_availability}。"
+        if matrix not in text:
+            extra.append(matrix)
+    if not extra:
+        return text
+    return (text + " " + " ".join(extra)).strip()
 
 
 def _sample_evidence_text(sample: dict[str, Any]) -> str:

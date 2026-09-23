@@ -347,6 +347,7 @@ export default function App() {
             <button disabled={!request.trim()} onClick={() => createProject.mutate()}>{t("createTopic")}</button>
             <button className="secondary" disabled={!projectId || parseSpec.isPending} onClick={() => parseSpec.mutate()}>{t("parseSpec")}</button>
           </div>
+          {keyPresent && projectId && !totalTokens(parseUsage) && <p className="muted">{t("parseHint")}</p>}
           {!!totalTokens(parseUsage) && <p className="muted">{t("parseUsage")} {totalTokens(parseUsage)}{parseUsage?.estimated && ` (${t("estimatedUsage")})`}</p>}
           <SpecEditor spec={spec} onChange={setSpec} />
           <div className="row">
@@ -555,6 +556,7 @@ function SpecEditor({ spec, onChange }: { spec: ResearchSpec; onChange: (s: Rese
           <option value="proteomics">{t("kind_proteomics")}</option>
           <option value="epigenomics">{t("kind_epigenomics")}</option>
           <option value="microbiome">{t("kind_microbiome")}</option>
+          <option value="small_rna">{t("kind_small_rna")}</option>
         </select>
       </label>
       <label>{t("assayMethods")}<input value={join(spec.assay_methods || [])} onChange={(e) => onChange({ ...spec, assay_methods: split(e.target.value) })} /></label>
@@ -592,7 +594,11 @@ function Detail({ data, runId, busy, onError, onOverride }: { data: Record<strin
       {selection.selected !== undefined && <p>{selection.selected ? `${t("selectionRank")}: ${selection.rank}` : t("notSelected")}</p>}
       {!!selection.reasons?.length && <p>{t("selectionReason")}: {selection.reasons.map((reason) => t(reason as MsgKey)).join(", ")}</p>}
       <p className="muted">{String(ds.summary ?? "")}</p>
-      <p>{t("gsmCount")} {String(rd?.gsm_count ?? "")}　{t("independentDonors")} {rd?.independent_donors == null ? t("unknown") : String(rd.independent_donors)}</p>
+      {rd?.reason ? <p>{String(rd.reason)}</p> : null}
+      <p>{t("gsmCount")} {String(rd?.gsm_count ?? "")}　{t("independentDonors")} {rd?.independent_donors == null ? (rd?.biosample_count ? t("donorUpperBound", { n: String(rd.biosample_count) }) : t("unknown")) : String(rd.independent_donors)}</p>
+      {typeof rd?.matrix_availability === "string" && !["", "unknown"].includes(rd.matrix_availability) && (
+        <p>{t("matrixFiles")} · {t(`matrix_${rd.matrix_availability}` as MsgKey)}</p>
+      )}
       <h4>{t("judgements")}</h4>
       <ul>
         {shown.map((a, i) => (

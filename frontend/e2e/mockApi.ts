@@ -73,7 +73,7 @@ export async function installMockApi(page: Page, projects: MockProject[], log: {
       return route.fulfill({ json: { llm_key_present: false, llm_base_url: "", llm_model: "", ncbi_email: "" } });
     }
     if (path === "/api/budget-presets") {
-      return route.fulfill({ json: { low: { max_unique_gse: 80, max_deep_verify: 0, max_tokens: 20000, max_runtime_s: 600 }, medium: { max_unique_gse: 150, max_deep_verify: 6, max_tokens: 150000, max_runtime_s: 1800 }, high: { max_unique_gse: 400, max_deep_verify: 20, max_tokens: 600000, max_runtime_s: 5400 }, ultra: { max_unique_gse: 1500, max_deep_verify: 100, max_tokens: 4000000, max_runtime_s: 21600 } } });
+      return route.fulfill({ json: { low: { max_unique_gse: 80, max_deep_verify: 0, max_tokens: 20000, max_runtime_s: 600 }, medium: { max_unique_gse: 250, max_deep_verify: 10, max_tokens: 400000, max_runtime_s: 3600 }, high: { max_unique_gse: 400, max_deep_verify: 20, max_tokens: 1000000, max_runtime_s: 5400 }, ultra: { max_unique_gse: 1500, max_deep_verify: 100, max_tokens: 4000000, max_runtime_s: 21600 } } });
     }
     if (path === "/api/projects" && method === "GET") {
       return route.fulfill({ json: created.map((p) => ({ id: p.id, name: p.name, original_request: p.original_request, spec: p.spec })) });

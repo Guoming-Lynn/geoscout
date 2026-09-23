@@ -12,7 +12,7 @@ def test_intensity_validation_and_custom_precedence():
     custom = Budget(max_unique_gse=7)
     assert resolve_run_budget(False, custom, "ultra") == (custom, "custom")
     tiers = [Budget.preset(t) for t in ("low", "medium", "high", "ultra")]
-    for field in ("max_queries", "max_unique_gse", "max_deep_verify", "max_tokens", "max_runtime_s"):
+    for field in ("max_queries", "max_unique_gse", "max_deep_verify", "max_tokens", "max_runtime_s", "sample_char_budget"):
         values = [getattr(t, field) for t in tiers]
         assert values == sorted(set(values))
 

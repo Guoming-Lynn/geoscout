@@ -34,7 +34,7 @@ _REAGENT = re.compile(
 )
 _PRIMARY = re.compile(
     r"biopsy|biopsies|postmortem|autopsy|surgical resection|blood draw|freshly isolated|"
-    r"primary tissue|whole blood|peripheral blood|\bpbmc\b|\bplasma\b|"
+    r"primary tissue|whole blood|peripheral blood|\bpbmcs?\b|\bblood\b|\bplasma\b|"
     r"(?<!fetal bovine )(?<!bovine )\bserum\b|pancreatic islets?|\bislets?\b|"
     r"dentate gyrus|hippocampus|cortex|isocortex|\bpons\b|brain nuclei|"
     r"synovial (?:tissue|fluid)|原代组织|活检|尸检|手术切除|直接采集|全血|外周血|血浆|血清|胰岛|脑组织|滑膜",
@@ -57,6 +57,13 @@ def _field_text(value: object) -> str:
         parts = [value.get("value"), value.get("raw"), value.get("key")]
         return " ".join(str(p) for p in parts if p)
     return json.dumps(value, ensure_ascii=False)
+
+
+def _extract_protocol(sample: dict) -> str:
+    fields = sample.get("protocol_fields")
+    if isinstance(fields, dict):
+        return _field_text(fields.get("extract_protocol"))
+    return ""
 
 
 def _material_text(sample: dict) -> str:
@@ -128,42 +135,93 @@ def source_kind(sample: dict) -> str | None:
     cultured = _unnegated(_CULTURE, material) or _unnegated(_CULTURE, _protocol_for_culture(sample))
     if cultured:
         return None
-    if _unnegated(_PRIMARY, material):
+    if _unnegated(_PRIMARY, material) or _unnegated(_PRIMARY, _extract_protocol(sample)):
         return "primary"
     return None
 
 
-def tissue_matches(sample: dict, tissues: list[str]) -> bool:
+def _tissue_values(sample: dict, *, include_extract: bool) -> str:
     values = [str(sample.get("source_name") or "")]
     for row in sample.get("characteristics") or []:
-        if isinstance(row, dict) and str(row.get("key") or "").casefold() in {"tissue", "organ", "tissue type", "tissue_type"}:
+        key = str(row.get("key") or "").casefold() if isinstance(row, dict) else ""
+        if key in {"tissue", "organ", "tissue type", "tissue_type"} or any(
+            part in key for part in ("cell type", "cell_type", "celltype", "cell population", "sample type")
+        ):
             values.append(str(row.get("value") or row.get("raw") or ""))
-    text = " ".join(values).casefold()
+    if include_extract:
+        values.append(_extract_protocol(sample))
+    return " ".join(values).casefold()
+
+
+def _blob_has_tissue(blob: str, tissues: list[str]) -> bool:
     terms = tissues + [t.term for t in lexicon_terms("tissue", tissues)]
-    return any(re.search(r"(?<!\w)" + re.escape(t.casefold()) + r"(?!\w)", text) for t in terms if t)
+    return any(re.search(r"(?<!\w)" + re.escape(t.casefold()) + r"(?!\w)", blob) for t in terms if t)
+
+
+def _material_has_tissue(sample: dict, tissues: list[str]) -> bool:
+    return _blob_has_tissue(_tissue_values(sample, include_extract=False), tissues)
+
+
+_PBMC_SUBSET_RE = re.compile(
+    r"\bsorted\b|\bt[\s\-]?cells?\b|\bb[\s\-]?cells?\b|\bnk[\s\-]?cells?\b|"
+    r"\btfh\b|\btscm\b|\btregs?\b|\bth\d+\b|\btemra\b|follicular helper|regulatory t|memory t|naive t|"
+    r"\bmonocytes?\b|\bmacrophages?\b|\bdendritic\b|\bneutrophils?\b|\bplasmablasts?\b|\bcd\d+\s*\+?",
+    re.I,
+)
+
+
+def _cell_type_values(sample: dict) -> list[str]:
+    out: list[str] = []
+    for row in sample.get("characteristics") or []:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("key") or "").casefold()
+        if any(part in key for part in ("cell type", "cell_type", "celltype", "cell population", "cell subset")):
+            out.append(str(row.get("value") or ""))
+    return out
+
+
+def _pbmc_subset(sample: dict, tissues: list[str]) -> bool:
+    """A sorted lymphocyte/myeloid fraction is not a PBMC sample."""
+    if not any(t.casefold() in {"pbmc", "pbmcs"} for t in tissues):
+        return False
+    return any(_PBMC_SUBSET_RE.search(value) for value in _cell_type_values(sample))
+
+
+def tissue_matches(sample: dict, tissues: list[str]) -> bool:
+    """Material fields win. Extract protocol can add a tissue only when those fields do not name another organ."""
+    if _pbmc_subset(sample, tissues):
+        return False
+    if _material_has_tissue(sample, tissues):
+        return True
+    if _material_conflicts(sample, tissues):
+        return False
+    return _blob_has_tissue(_tissue_values(sample, include_extract=True), tissues)
 
 
 _OFF_TISSUE = {
-    "brain": ["blood", "pbmc", "heart", "liver", "intestine", "colon", "gut"],
+    "brain": ["blood", "pbmc", "heart", "liver", "intestine", "colon", "gut", "synovial", "adipose", "olfactory epithelium", "nasal", "olfactory mucosa"],
     "intestine": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
     "colon": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
     "gut": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
-    "pancreatic islets": ["blood", "pbmc", "brain", "heart", "liver"],
+    "pancreatic islets": ["blood", "pbmc", "brain", "heart", "liver", "adipose", "synovial", "muscle"],
     "plaque": ["blood", "pbmc"],
-    "pbmc": ["brain", "heart", "liver", "intestine", "colon"],
-    "blood": ["brain", "heart", "liver", "intestine", "colon"],
+    "pbmc": ["brain", "cortex", "hippocampus", "heart", "liver", "intestine", "colon", "synovial", "synovium", "adipose", "muscle", "cd4", "cd8", "cd14", "cd16", "cd19", "cd56", "monocytes", "neutrophils", "whole blood", "plasma", "serum", "platelets"],
+    "blood": ["brain", "cortex", "hippocampus", "heart", "liver", "intestine", "colon", "synovial", "adipose"],
+    "lung": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
+    "liver": ["blood", "pbmc", "brain", "lung", "heart", "islet"],
+    "kidney": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
+    "synovium": ["blood", "pbmc", "brain", "muscle", "adipose"],
+    "skeletal muscle": ["blood", "pbmc", "brain", "synovial", "adipose"],
 }
 
 
-def sample_tissue_conflicts(sample: dict, tissues: list[str]) -> bool:
-    """True when sample material fields name a different organ than the requested tissue."""
-    if not tissues or tissue_matches(sample, tissues):
+def _material_conflicts(sample: dict, tissues: list[str]) -> bool:
+    if tissues and _pbmc_subset(sample, tissues):
+        return True
+    if not tissues or _material_has_tissue(sample, tissues):
         return False
-    values = [str(sample.get("source_name") or "")]
-    for row in sample.get("characteristics") or []:
-        if isinstance(row, dict) and str(row.get("key") or "").casefold() in {"tissue", "organ", "tissue type", "tissue_type"}:
-            values.append(str(row.get("value") or row.get("raw") or ""))
-    blob = " ".join(values).casefold()
+    blob = _tissue_values(sample, include_extract=False)
     if not blob.strip():
         return False
     offs: list[str] = []
@@ -171,3 +229,8 @@ def sample_tissue_conflicts(sample: dict, tissues: list[str]) -> bool:
         offs.extend(_OFF_TISSUE.get(seed.casefold(), []))
         offs.extend(_OFF_TISSUE.get(seed, []))
     return any(re.search(r"(?<!\w)" + re.escape(term.casefold()) + r"(?!\w)", blob) for term in offs if term)
+
+
+def sample_tissue_conflicts(sample: dict, tissues: list[str]) -> bool:
+    """True when sample material fields name a different organ than the requested tissue."""
+    return _material_conflicts(sample, tissues)

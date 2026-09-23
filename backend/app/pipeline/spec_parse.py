@@ -68,7 +68,25 @@ ASSAY_PATTERNS = [
     (r"microbiome|microbiota|metagenom|\b16s\b|微生物组", "microbiome"),
     (r"snrna|single[- ]nucleus|单核", "snrna_seq"),
     (r"scrna|single[- ]cell|cite-?seq|单细胞", "scrna_seq"),
+    (r"\b(?:mi|micro|nc)[\s\-]?rna[\s\-]?seq\b|\bsmall[\s\-]?rna[\s\-]?seq\b", "small_rna"),
     (r"\bbulk\b|转录组测序", "bulk_rna_seq"),
+]
+# Named sample material. "lesion" stays out: it is a group word, not proof of plaque.
+_TISSUE_RULES: list[tuple[str, str]] = [
+    ("pbmc", r"\bpbmcs?\b|外周血单个核|外周血单核|peripheral blood mononuclear"),
+    ("pancreatic islets", r"胰岛|pancreatic islets?|\bislets?\b"),
+    ("carotid", r"颈动脉|\bcarotid\b"),
+    ("artery", r"主动脉|\baorta\b|\baortic\b|\bartery\b|\barterial\b"),
+    ("plaque", r"斑块|\bplaque\b|\batheroma\b"),
+    ("synovium", r"滑膜|\bsynovi(?:um|al)\b"),
+    ("skeletal muscle", r"骨骼肌|skeletal muscle"),
+    ("intestine", r"肠组织|肠道组织|intestinal tissue|colon tissue|\bcolon\b|intestin"),
+    ("liver", r"肝脏|肝组织|\bliver\b|\bhepatic\b"),
+    ("kidney", r"肾脏|肾组织|\bkidney\b|\brenal\b"),
+    ("lung", r"肺组织|\blung\b"),
+    ("breast", r"乳腺|乳房|\bbreast\b|\bmammary\b"),
+    ("brain", r"脑组织|\bbrain\b|\bcortex\b|\bhippocampus\b|\bcerebral\b|\bdentate\b"),
+    ("blood", r"全血|外周血|whole blood|peripheral blood|\bblood\b"),
 ]
 _NONRNA_ASSAYS = {"spatial_transcriptomics", "proteomics", "epigenomics", "microbiome"}
 _PRIMARY_MATERIAL = (
@@ -285,6 +303,17 @@ def _merge_supported_methods(existing: list, extra: object, request: str) -> lis
     return out
 
 
+def _named_tissues(text: str) -> list[str]:
+    """Tissues the user actually named. More specific tissues win over blood."""
+    found: list[str] = []
+    for name, pattern in _TISSUE_RULES:
+        if re.search(pattern, text, re.I) and name not in found:
+            found.append(name)
+    if "pbmc" in found and "blood" in found:
+        found = [name for name in found if name != "blood"]
+    return found
+
+
 def heuristic_parse(text: str) -> ResearchSpec:
     """Deterministic parse that never invents unspecified constraints."""
     spec = ResearchSpec(original_request=text)
@@ -310,24 +339,12 @@ def heuristic_parse(text: str) -> ResearchSpec:
 
     spec.assay_methods = [item for item in detect_epigen_methods(text) if item in EPIGEN_METHODS]
 
-    if re.search(r"颈动脉|carotid", lower):
-        spec.tissues.append("carotid")
-    if re.search(r"主动脉|aorta|aortic", lower):
-        spec.tissues.append("artery")
-    if re.search(r"斑块|plaque", lower):
-        spec.tissues.append("plaque")
-    if re.search(r"肠组织|肠道组织|intestinal tissue|colon tissue|\bcolon\b|intestin", lower):
-        spec.tissues.append("intestine")
-    if re.search(r"脑组织|brain tissue|\bbrain\b", lower):
-        spec.tissues.append("brain")
-    if re.search(r"乳腺|乳房|\bbreast\b", lower):
-        spec.tissues.append("breast")
-    spec.tissues = list(dict.fromkeys(spec.tissues))
+    spec.tissues = _named_tissues(text)
     if spec.tissues and request_supports_tissues(text, spec.tissues):
         spec.tissue_required = True
 
     apply_parse_completeness(spec)
-    if not spec.assay_types and re.search(r"rna[- ]?seq|rna sequencing", lower):
+    if not spec.assay_types and re.search(r"(?<![A-Za-z])rna[- ]?seq|(?<![A-Za-z])rna sequencing", lower):
         spec.assay_types.append("rna_seq_generic")
 
     if (spec.disease or re.search(r"病变|病例|lesion|case|disease", lower)) and re.search(r"对照|control|healthy|adjacent", lower):

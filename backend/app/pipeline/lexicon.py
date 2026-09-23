@@ -34,9 +34,14 @@ TISSUE_SYNONYMS: dict[str, list[str]] = {
     "artery": ["artery", "arterial", "aorta", "aortic"],
     "plaque": ["plaque", "atheroma", "lesion"],
     "brain": ["brain", "cerebral", "cortex", "isocortex", "hippocampus", "dentate gyrus", "pons", "temporal gyrus", "脑组织"],
-    "blood": ["blood", "pbmc", "peripheral blood"],
-    "pancreatic islets": ["pancreatic islets", "pancreatic islet", "islets"],
-    "pbmc": ["pbmc", "peripheral blood mononuclear cells"],
+    "blood": ["blood", "pbmc", "pbmcs", "peripheral blood", "whole blood", "全血", "外周血"],
+    "pancreatic islets": ["pancreatic islets", "pancreatic islet", "islets", "islet", "胰岛"],
+    "pbmc": ["pbmc", "pbmcs", "peripheral blood mononuclear cells", "外周血单个核细胞", "外周血单核细胞"],
+    "synovium": ["synovium", "synovial", "synovial tissue", "滑膜"],
+    "skeletal muscle": ["skeletal muscle", "骨骼肌"],
+    "liver": ["liver", "hepatic", "肝脏", "肝组织"],
+    "kidney": ["kidney", "renal", "肾脏", "肾组织"],
+    "lung": ["lung", "肺组织"],
     "intestine": [
         "intestine",
         "intestinal",
@@ -84,6 +89,7 @@ ASSAY_SYNONYMS: dict[str, list[str]] = {
     "proteomics": ["proteomics", "proteomic", "mass spectrometry"],
     "epigenomics": ["ATAC-seq", "ChIP-seq", "epigenomics", "chromatin accessibility"],
     "microbiome": ["microbiome", "microbiota", "16S", "metagenome"],
+    "small_rna": ["miRNA-seq", "microRNA-seq", "ncRNA-seq", "small RNA-seq"],
 }
 
 ORGANISM_TERMS: dict[str, list[str]] = {
@@ -98,6 +104,7 @@ ASSAY_GTYP = {
     "bulk_rna_seq": "Expression profiling by high throughput sequencing",
     "spatial_transcriptomics": "Expression profiling by high throughput sequencing",
     "epigenomics": "Genome binding/occupancy profiling by high throughput sequencing",
+    "small_rna": "Non-coding RNA profiling by high throughput sequencing",
 }
 
 # 10x is a supplementary platform signal, never used as the sole assay proof.
@@ -107,6 +114,7 @@ ASSAY_SUPPLEMENTAL = {
     "epigenomics": ["ATAC-seq", "ChIP-seq"],
     "proteomics": ["mass spectrometry", "proteomics"],
     "microbiome": ["16S", "microbiome"],
+    "small_rna": ["miRNA-seq", "small RNA-seq"],
 }
 
 

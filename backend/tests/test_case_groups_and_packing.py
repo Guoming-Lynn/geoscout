@@ -43,8 +43,9 @@ def test_limited_input_contains_both_groups_and_reports_incomplete():
     spec = heuristic_parse("human type 2 diabetes RNA-seq disease and control")
     rows = [sample("T2DM", f"GSM{i}") for i in range(50)] + [sample("Control", f"GSM{i}") for i in range(50, 100)]
     packed, coverage = fit_samples(rows, spec=spec, budget=1200)
-    assert {s["group_label"] for s in packed[:2]} == {"case", "control"}
-    assert not coverage["complete"]
+    assert {s["group_label"] for s in packed} == {"case", "control"}
+    assert coverage["complete"] is True
+    assert coverage["represented"] == 100
     assert len(json.dumps(packed, ensure_ascii=False)) <= 1200
 
 
