@@ -123,6 +123,35 @@ def test_reason_reports_independent_donors_when_keys_exist():
     assert "独立供体：case 3 / control 5。" in text
 
 
+def test_cell_level_gsm_counts_are_not_presented_as_donors():
+    spec = heuristic_parse(T2D)
+    samples = []
+    for index in range(60):
+        disease = "T2D" if index < 30 else "non-diabetic"
+        samples.append(
+            {
+                "gsm": f"GSM{index}",
+                "title": f"islet cell {index}",
+                "library_strategy": "RNA-Seq",
+                "library_source": "transcriptomic",
+                "characteristics": [
+                    {"key": "tissue", "value": "Pancreatic islets", "raw": "tissue: Pancreatic islets"},
+                    {"key": "cell type", "value": "Beta", "raw": "cell type: Beta"},
+                    {"key": "disease", "value": disease, "raw": f"disease: {disease}"},
+                ],
+            }
+        )
+    summary = {"title": "islet single cells", "taxon": "Homo sapiens", "gdstype": "Expression profiling by high throughput sequencing"}
+    rules = rule_judgements(spec, summary, samples)
+    text = _annotate_reason("全部硬条件通过。", _Row(), summary, samples, spec=spec, merged=rules)
+    assert "一个 GSM 多半是一个细胞" in text
+
+
+def test_title_hint_ignores_donors_that_only_appear_in_treated_samples():
+    text = _reason(heuristic_parse(RA), "GSE189136")
+    assert "约 5 位个体" not in text
+
+
 def test_title_count_hint_skips_one_cell_per_gsm_series():
     cells = [{"title": f"10th_C{i % 96}_S{i}"} for i in range(640)]
     assert _title_individual_count(cells) is None

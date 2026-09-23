@@ -1226,6 +1226,21 @@ def _age_mismatch_note(cohort: list[dict[str, Any]], labels: dict[str, str]) -> 
     return f"年龄段不匹配：{shown} 个 GSM 来自胎儿/儿童/青少年供体，另一组没有。"
 
 
+def _single_cell_gsm_note(cohort: list[dict[str, Any]]) -> str:
+    """One-cell-per-GSM series must not be read as one person per GSM."""
+    if len(cohort) < 50 or any(sample.get("donor_key") for sample in cohort):
+        return ""
+
+    def is_cell(sample: dict[str, Any]) -> bool:
+        if "single" in str(sample.get("library_source") or "").casefold():
+            return True
+        return any("cell" in key and "type" in key for key in _char_map(sample))
+
+    if sum(is_cell(sample) for sample in cohort) * 2 < len(cohort):
+        return ""
+    return "一个 GSM 多半是一个细胞而不是一位供体，队列规模不能按 GSM 数理解。"
+
+
 def _annotate_reason(
     reason: str,
     rd: RunDataset,
@@ -1237,6 +1252,7 @@ def _annotate_reason(
 ) -> str:
     extra: list[str] = []
     text = reason or ""
+    cohort_samples: list[dict[str, Any]] = []
     note = mixed_omics_note(summary, samples)
     if note and note not in text:
         extra.append(note)
@@ -1250,7 +1266,6 @@ def _annotate_reason(
             counts: dict[str, int] = {}
             donors: dict[str, set[str]] = {}
             labels: dict[str, str] = {}
-            cohort_samples: list[dict[str, Any]] = []
             for gsm in groups.qualifying_gsms:
                 sample = by_gsm.get(str(gsm).upper())
                 label = infer_group_label(sample, spec=spec) if sample is not None else None
@@ -1274,6 +1289,9 @@ def _annotate_reason(
                     effective = {label: len(donors.get(label, ())) for label in ordered}
                 else:
                     effective = dict(counts)
+                    cell_note = _single_cell_gsm_note(cohort_samples)
+                    if cell_note and cell_note not in text:
+                        extra.append(cell_note)
                 for note in (_repeated_sample_note(cohort_samples), _age_mismatch_note(cohort_samples, labels)):
                     if note and note not in text:
                         extra.append(note)
@@ -1285,7 +1303,7 @@ def _annotate_reason(
         donor = f"独立供体字段不完整；{rd.biosample_count} 个 BioSample 只是未去重的上限。"
         if donor not in text:
             extra.append(donor)
-        individuals = _title_individual_count(samples)
+        individuals = _title_individual_count(cohort_samples or samples)
         if individuals:
             hint = f"样本名提示约 {individuals} 位个体（仅供参考）。"
             if hint not in text:

@@ -192,7 +192,7 @@ def test_cohort_size_is_written_into_the_reason():
     text = _annotate_reason("全部硬条件通过。", _Row(), summary, samples, spec=spec, merged=rules)
     assert "适用队列：case 2 / control 2 个 GSM。" in text
     assert "每组样本很少" in text
-    assert "样本名提示约" in text
+    assert "约 5 位个体" not in text
     assert groups.verdict == "pass"
 
 
