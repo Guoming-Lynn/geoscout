@@ -123,28 +123,40 @@ def test_reason_reports_independent_donors_when_keys_exist():
     assert "独立供体：case 3 / control 5。" in text
 
 
-def test_cell_level_gsm_counts_are_not_presented_as_donors():
-    spec = heuristic_parse(T2D)
+def _islet_cohort(cell_types: tuple[str, ...]) -> list[dict]:
     samples = []
     for index in range(60):
         disease = "T2D" if index < 30 else "non-diabetic"
+        cell = cell_types[index % len(cell_types)]
         samples.append(
             {
                 "gsm": f"GSM{index}",
-                "title": f"islet cell {index}",
+                "title": f"islet {index}",
                 "library_strategy": "RNA-Seq",
                 "library_source": "transcriptomic",
                 "characteristics": [
                     {"key": "tissue", "value": "Pancreatic islets", "raw": "tissue: Pancreatic islets"},
-                    {"key": "cell type", "value": "Beta", "raw": "cell type: Beta"},
+                    {"key": "cell type", "value": cell, "raw": f"cell type: {cell}"},
                     {"key": "disease", "value": disease, "raw": f"disease: {disease}"},
                 ],
             }
         )
-    summary = {"title": "islet single cells", "taxon": "Homo sapiens", "gdstype": "Expression profiling by high throughput sequencing"}
+    return samples
+
+
+def _cohort_reason(samples: list[dict]) -> str:
+    spec = heuristic_parse(T2D)
+    summary = {"title": "islets", "taxon": "Homo sapiens", "gdstype": "Expression profiling by high throughput sequencing"}
     rules = rule_judgements(spec, summary, samples)
-    text = _annotate_reason("全部硬条件通过。", _Row(), summary, samples, spec=spec, merged=rules)
-    assert "一个 GSM 多半是一个细胞" in text
+    return _annotate_reason("全部硬条件通过。", _Row(), summary, samples, spec=spec, merged=rules)
+
+
+def test_cell_level_gsm_counts_are_not_presented_as_donors():
+    assert "一个 GSM 多半是一个细胞" in _cohort_reason(_islet_cohort(("Alpha", "Beta", "Delta")))
+
+
+def test_bulk_cohort_with_one_cell_type_is_not_called_single_cell():
+    assert "一个 GSM 多半是一个细胞" not in _cohort_reason(_islet_cohort(("Beta",)))
 
 
 def test_title_hint_ignores_donors_that_only_appear_in_treated_samples():

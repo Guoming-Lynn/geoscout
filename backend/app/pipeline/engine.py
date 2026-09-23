@@ -1176,7 +1176,8 @@ _PEDIATRIC_RE = re.compile(
     r"\b(?:fetal|fetus|foetal|embryo\w*|newborn|neonat\w*|infant|toddler|child\w*|juvenile|adolescen\w*|pediatric|paediatric)\b",
     re.I,
 )
-_PERSONAL_KEYS = ("age", "sex", "gender", "bmi", "hba1c", "ethnic", "race", "pmi")
+_PERSONAL_KEY_RE = re.compile(r"\b(?:age|sex|gender|bmi|hba1c|ethnic\w*|race|pmi)\b")
+_AGE_KEY_RE = re.compile(r"\bage|\bstage|develop")
 
 
 def _char_map(sample: dict[str, Any]) -> dict[str, str]:
@@ -1193,10 +1194,10 @@ def _repeated_sample_note(cohort: list[dict[str, Any]]) -> str:
         return ""
     maps = [_char_map(s) for s in cohort]
     keys = set.intersection(*(set(m) for m in maps))
-    if not any(any(p in k for p in _PERSONAL_KEYS) for k in keys):
+    if not any(_PERSONAL_KEY_RE.search(k) for k in keys):
         return ""
     for key in sorted(keys):
-        if any(p in key for p in _PERSONAL_KEYS) or len({m[key] for m in maps}) < 2:
+        if _PERSONAL_KEY_RE.search(key) or len({m[key] for m in maps}) < 2:
             continue
         buckets: dict[tuple, set[str]] = {}
         sizes: dict[tuple, int] = {}
@@ -1217,7 +1218,7 @@ def _age_mismatch_note(cohort: list[dict[str, Any]], labels: dict[str, str]) -> 
         if not label:
             continue
         total[label] = total.get(label, 0) + 1
-        values = " ".join(v for k, v in _char_map(sample).items() if "age" in k or "stage" in k or "develop" in k)
+        values = " ".join(v for k, v in _char_map(sample).items() if _AGE_KEY_RE.search(k))
         if _PEDIATRIC_RE.search(values):
             young[label] = young.get(label, 0) + 1
     if not young or len(total) < 2 or all(young.get(g, 0) for g in total):
@@ -1231,12 +1232,15 @@ def _single_cell_gsm_note(cohort: list[dict[str, Any]]) -> str:
     if len(cohort) < 50 or any(sample.get("donor_key") for sample in cohort):
         return ""
 
-    def is_cell(sample: dict[str, Any]) -> bool:
-        if "single" in str(sample.get("library_source") or "").casefold():
-            return True
-        return any("cell" in key and "type" in key for key in _char_map(sample))
-
-    if sum(is_cell(sample) for sample in cohort) * 2 < len(cohort):
+    single = sum("single" in str(sample.get("library_source") or "").casefold() for sample in cohort)
+    # Bulk cohorts also carry one fixed "cell type" (PBMC, CD14 monocytes); per-cell annotation varies.
+    cell_types = {
+        value.casefold()
+        for sample in cohort
+        for key, value in _char_map(sample).items()
+        if "cell" in key and "type" in key and value
+    }
+    if single * 2 < len(cohort) and len(cell_types) < 3:
         return ""
     return "一个 GSM 多半是一个细胞而不是一位供体，队列规模不能按 GSM 数理解。"
 
