@@ -29,16 +29,43 @@ def estimate_tokens(text: str) -> int:
     return max(32, len(text) // 4)
 
 
+def _aware(value: datetime | None) -> datetime | None:
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def active_elapsed_s(run: Any, now: datetime | None = None) -> float:
+    """Wall clock minus time spent paused or waiting for credentials."""
+    started = _aware(getattr(run, "started_at", None))
+    if started is None:
+        return 0
+    now = now or datetime.now(timezone.utc)
+    paused = float(getattr(run, "paused_total_s", 0) or 0)
+    pause_started = _aware(getattr(run, "pause_started_at", None))
+    if pause_started is not None:
+        paused += max(0, (now - pause_started).total_seconds())
+    return max(0, (now - started).total_seconds() - paused)
+
+
+def note_pause(run: Any, now: datetime | None = None) -> None:
+    if getattr(run, "pause_started_at", None) is None:
+        run.pause_started_at = now or datetime.now(timezone.utc)
+
+
+def note_resume(run: Any, now: datetime | None = None) -> None:
+    pause_started = _aware(getattr(run, "pause_started_at", None))
+    if pause_started is None:
+        return
+    now = now or datetime.now(timezone.utc)
+    run.paused_total_s = float(getattr(run, "paused_total_s", 0) or 0) + max(0, (now - pause_started).total_seconds())
+    run.pause_started_at = None
+
+
 def check_before_external(run: Any, budget: Budget, *, next_action: str, reserve: int = 0) -> None:
     """Raise BudgetStop if the next NCBI/LLM/FTP call must not be scheduled."""
-    now = datetime.now(timezone.utc)
-    started = getattr(run, "started_at", None)
-    if started is not None:
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        elapsed = (now - started).total_seconds()
-        if elapsed >= budget.max_runtime_s:
-            raise BudgetStop("达到运行时间预算", unfinished=next_action)
+    if getattr(run, "started_at", None) is not None and active_elapsed_s(run) >= budget.max_runtime_s:
+        raise BudgetStop("达到运行时间预算", unfinished=next_action)
     usage = load(getattr(run, "token_usage_json", None), {})
     total, estimated = token_totals(usage)
     if total >= budget.max_tokens:

@@ -39,6 +39,8 @@ class Run(Base):
     stop_reason: Mapped[str] = mapped_column(Text, default="")
     pause_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    paused_total_s: Mapped[float] = mapped_column(Float, default=0)
+    pause_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     config_summary: Mapped[str] = mapped_column(Text, default="{}")
     counters_json: Mapped[str] = mapped_column(Text, default="{}")
     token_usage_json: Mapped[str] = mapped_column(Text, default="{}")

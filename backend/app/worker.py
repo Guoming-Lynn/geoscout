@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +34,24 @@ async def loop() -> None:
                 await asyncio.sleep(0.4)
                 continue
             await session.commit()
+            stop = asyncio.Event()
+
+            async def renew(job_id: str) -> None:
+                interval = max(5, settings.job_lease_s / 3)
+                while not stop.is_set():
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=interval)
+                        return
+                    except TimeoutError:
+                        pass
+                    async with SessionLocal() as beat:
+                        current = await beat.get(Job, job_id)
+                        if current is None or current.status != "leased" or current.worker_id != WORKER_ID:
+                            return
+                        await heartbeat(beat, current, settings.job_lease_s)
+                        await beat.commit()
+
+            renew_task = asyncio.create_task(renew(job.id))
             try:
                 async with SessionLocal() as work:
                     job2 = await work.get(Job, job.id)
@@ -45,6 +64,11 @@ async def loop() -> None:
             except Exception:
                 logger.exception("worker job crashed")
                 await asyncio.sleep(1)
+            finally:
+                stop.set()
+                renew_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await renew_task
 
 
 def run() -> None:

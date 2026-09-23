@@ -133,3 +133,28 @@ async def test_api_and_excel_share_control_cohort():
     excel_gsms = {part.strip() for part in str(excel_rows[0].get("采用GSM子集") or "").split(",") if part.strip()}
     assert api_gsms == {"CASE1", "CTRL1"}
     assert excel_gsms == api_gsms
+
+
+@pytest.mark.asyncio
+async def test_repeat_override_keeps_original_machine_category():
+    await init_db()
+    pid, rid, gse = new_id(), new_id(), f"GSE{new_id()[:8].upper()}"
+    async with SessionLocal() as session:
+        from app.db.models import Project
+        session.add(Project(id=pid, name="override", original_request="x"))
+        await session.flush()
+        session.add(Run(id=rid, project_id=pid, status="paused", mode="full"))
+        session.add(Dataset(gse=gse, title="t", taxon="Homo sapiens"))
+        await session.flush()
+        session.add(RunDataset(id=new_id(), run_id=rid, gse=gse, category="needs_review"))
+        await session.commit()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client:
+        first = await client.post(f"/api/runs/{rid}/datasets/{gse}/override", json={"category": "recommended", "reason": "one"})
+        second = await client.post(f"/api/runs/{rid}/datasets/{gse}/override", json={"category": "excluded", "reason": "two"})
+        detail = await client.get(f"/api/runs/{rid}/datasets/{gse}")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["machine_previous"] == "needs_review"
+    assert detail.status_code == 200
+    assert detail.json()["run_dataset"]["category"] == "excluded"
+    assert detail.json()["override"]["new_category"] == "excluded"

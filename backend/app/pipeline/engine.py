@@ -19,7 +19,7 @@ from app.core.config import settings
 from app.core.credentials import SessionCredentials, store
 from app.core.usage import add_usage
 from app.core.urls import accession_page
-from app.db.models import Assessment, Dataset, DatasetRelation, Job, QueryAttempt, Run, RunDataset, Sample
+from app.db.models import Assessment, Dataset, DatasetRelation, Job, Override, QueryAttempt, Run, RunDataset, Sample
 from app.evidence.soft_parser import count_independent_donors, parse_soft_bytes, series_as_dict
 from app.evidence.store import add_evidence, evidence_bundle, new_id, write_snapshot
 from app.pipeline.assessment import (
@@ -30,7 +30,7 @@ from app.pipeline.assessment import (
     judge_user_payload,
     merge_final,
 )
-from app.pipeline.budget import BudgetStop, check_before_external, estimate_tokens, review_token_reserve
+from app.pipeline.budget import BudgetStop, check_before_external, estimate_tokens, note_pause, review_token_reserve
 from app.pipeline.donors import donors_per_group, infer_group_label
 from app.pipeline.query_planner import plan_queries
 from app.pipeline.ranking import relevance, select_deep_targets
@@ -56,6 +56,10 @@ TERMINAL = {"completed", "partial", "failed", "cancelled"}
 
 
 class WaitingForCredentials(Exception):
+    pass
+
+
+class StopForCancel(Exception):
     pass
 
 
@@ -86,6 +90,7 @@ class Engine:
         if run.pause_requested and run.status not in TERMINAL:
             run.status = "paused"
             run.stop_reason = "用户暂停"
+            note_pause(run)
             self.job.status = "queued"
             await add_event(self.session, run.id, "已在原子步骤边界暂停")
             return
@@ -102,9 +107,16 @@ class Engine:
                 "finalize": self.step_finalize,
             }[self.job.step]
             await handler(run)
+        except StopForCancel:
+            run.status = "cancelled"
+            run.stop_reason = run.stop_reason or "用户取消"
+            run.finished_at = datetime.now(timezone.utc)
+            self.job.status = "cancelled"
+            await add_event(self.session, run.id, "已取消，未发出下一步模型请求")
         except WaitingForCredentials:
             run.status = "waiting_for_credentials"
             run.stop_reason = "进程重启或尚未提供模型 Key，检查点已保留"
+            note_pause(run)
             self.job.status = "waiting_credentials"
             await add_event(self.session, run.id, "等待重新提供模型凭据", level="warn")
         except BudgetStop as exc:
@@ -415,6 +427,7 @@ class Engine:
     async def step_screen(self, run: Run) -> None:
         run.stage = "screening"
         spec = self._spec(run)
+        overrides = await self._latest_overrides(run.id)
         rows = (await self.session.execute(select(RunDataset).where(RunDataset.run_id == run.id))).scalars().all()
         for rd in rows:
             ds = await self.session.get(Dataset, rd.gse)
@@ -435,7 +448,7 @@ class Engine:
                 j.verdict == "fail" and not j.clue_only and _is_hard(spec, j.criterion_id) for j in judgements
             )
             if hard_fail:
-                rd.category, rd.reason = classify(
+                category, reason = classify(
                     spec,
                     judgements,
                     verified=True,
@@ -446,9 +459,14 @@ class Engine:
                 )
                 rd.verification_status = "rule_excluded"
             else:
-                rd.category = "needs_review"
+                category, reason = "needs_review", "初筛完成，未做深度核验。" + ("待核实条件: " + ", ".join(unknown) if unknown else "摘要线索不能替代样本核验。")
                 rd.verification_status = "summary_screened"
-                rd.reason = "初筛完成，未做深度核验。" + ("待核实条件: " + ", ".join(unknown) if unknown else "摘要线索不能替代样本核验。")
+            kept = overrides.get(rd.gse)
+            if kept is not None:
+                rd.category = kept.new_category
+                rd.reason = kept.reason or reason
+            else:
+                rd.category, rd.reason = category, reason
             await _replace_assessments(self.session, run.id, rd.gse, "rule_screen", judgements, actor="rule")
         await add_event(self.session, run.id, f"规则初筛完成，{len(rows)} 条 GSE")
         self.job.status = "done"
@@ -703,7 +721,7 @@ class Engine:
         rd.conflict_json = dump(conflicts)
         depth_complete = rd.verification_status in {"soft_loaded", "assessed"} and coverage.get("complete", True)
         verified = depth_complete and review_complete and not conflicts and not rd.model_output_invalid
-        rd.category, rd.reason = classify(
+        category, reason = classify(
             spec,
             merged,
             verified=verified,
@@ -712,8 +730,14 @@ class Engine:
             depth_complete=depth_complete,
             review_complete=review_complete,
         )
+        kept = (await self._latest_overrides(run.id)).get(rd.gse)
+        if kept is not None:
+            rd.category = kept.new_category
+            rd.reason = kept.reason or reason
+        else:
+            rd.category, rd.reason = category, reason
         score, coverage_score, _ = soft_score(spec, merged)
-        if rd.category == "needs_review" and rd.concerns and rd.concerns.startswith("模型请求失败"):
+        if rd.category == "needs_review" and rd.concerns and rd.concerns.startswith("模型请求失败") and kept is None:
             rd.reason = rd.concerns
         rd.soft_score = score
         rd.soft_coverage = coverage_score
@@ -741,6 +765,8 @@ class Engine:
         coverage: dict[str, Any],
     ) -> CheckedAssessment:
         llm = self._llm(run)
+        if await self._peer_cancelled(run):
+            raise StopForCancel()
         user = json.dumps(
             judge_user_payload(spec, rd.gse, summary=summary, evidence=evidence, samples=sample_dicts),
             ensure_ascii=False,
@@ -796,6 +822,8 @@ class Engine:
         coverage: dict[str, Any],
         gse: str,
     ) -> CheckedAssessment:
+        if await self._peer_cancelled(run):
+            raise StopForCancel()
         try:
             self._guard(run, "llm")
         except BudgetStop:
@@ -883,6 +911,31 @@ class Engine:
             await add_event(self.session, run.id, f"忽略迟到步骤 {self.job.step}，任务已是 {status}")
             return True
         return False
+
+    async def _peer_cancelled(self, run: Run) -> bool:
+        try:
+            from app.db.session import SessionLocal
+
+            async with SessionLocal() as peek:
+                peer = await peek.get(Run, run.id)
+        except Exception:
+            return bool(run.cancel_requested)
+        if peer is None or not peer.cancel_requested:
+            return False
+        run.cancel_requested = True
+        if run.status not in TERMINAL:
+            run.status = "cancelled"
+            run.stop_reason = run.stop_reason or "用户取消"
+            run.finished_at = datetime.now(timezone.utc)
+        return True
+
+    async def _latest_overrides(self, run_id: str) -> dict[str, Override]:
+        rows = (
+            await self.session.execute(
+                select(Override).where(Override.run_id == run_id).order_by(Override.created_at.asc(), Override.id.asc())
+            )
+        ).scalars().all()
+        return {row.gse: row for row in rows}
 
 
 def _screen_summary(ds: Dataset | None) -> dict[str, Any]:

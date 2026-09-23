@@ -13,7 +13,17 @@ def test_missing_tokens_are_estimated_not_zero():
     assert estimate_tokens("abcd" * 100) >= 32
 
 
-def test_runtime_budget_stops_before_next_call():
+def test_paused_time_does_not_consume_runtime_budget():
+    now = datetime.now(timezone.utc)
+    run = SimpleNamespace(
+        started_at=now - timedelta(hours=2),
+        pause_started_at=now - timedelta(hours=1, minutes=50),
+        paused_total_s=0,
+        token_usage_json='{"prompt_tokens": 0, "completion_tokens": 0}',
+        counters_json="{}",
+        checkpoint_json="{}",
+    )
+    check_before_external(run, Budget(max_runtime_s=30 * 60), next_action="search")
     run = SimpleNamespace(
         started_at=datetime.now(timezone.utc) - timedelta(seconds=10),
         token_usage_json='{"prompt_tokens": 0, "completion_tokens": 0}',

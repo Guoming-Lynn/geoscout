@@ -53,11 +53,38 @@ class CredentialStore:
         self._items: dict[str, SessionCredentials] = {}
 
     def get_or_create(self, session_id: str | None) -> SessionCredentials:
+        self._prune()
         sid = session_id or secrets.token_urlsafe(18)
         with self._lock:
             if sid not in self._items:
                 self._items[sid] = SessionCredentials(session_id=sid)
             return self._items[sid]
+
+    def _prune(self) -> None:
+        """Drop stale empty sessions. Keep recently updated sessions that still hold keys."""
+        now = datetime.now(timezone.utc)
+        max_items = 200
+        with self._lock:
+            stale = [
+                sid
+                for sid, creds in self._items.items()
+                if not creds.llm_api_key
+                and not creds.ncbi_api_key
+                and (now - creds.updated_at).total_seconds() > 3600
+            ]
+            for sid in stale:
+                self._items.pop(sid, None)
+            if len(self._items) <= max_items:
+                return
+            ranked = sorted(self._items.values(), key=lambda item: item.updated_at)
+            for creds in ranked:
+                if len(self._items) <= max_items:
+                    break
+                if creds.llm_api_key or creds.ncbi_api_key:
+                    continue
+                if (now - creds.updated_at).total_seconds() < 600:
+                    continue
+                self._items.pop(creds.session_id, None)
 
     def update(self, session_id: str, **fields: object) -> SessionCredentials:
         creds = self.get_or_create(session_id)

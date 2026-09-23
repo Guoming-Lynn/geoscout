@@ -5,11 +5,12 @@ from httpx import ASGITransport, AsyncClient
 
 from sqlalchemy import select, update
 
+from app.connectors.llm import LLMProvider
 from app.db.models import Job, Project, Run
 from app.db.session import SessionLocal, init_db
 from app.evidence.store import new_id
 from app.main import app
-from app.pipeline.engine import Engine, WaitingForCredentials
+from app.pipeline.engine import Engine, StopForCancel, WaitingForCredentials
 from app.pipeline.repo import claim_job, dump, enqueue_job
 from app.prompts import load_prompt
 from app.schemas.spec import Budget
@@ -305,3 +306,42 @@ async def test_cancel_paused_run_finishes_without_worker():
         jobs = (await session.execute(select(Job).where(Job.run_id == rid))).scalars().all()
         assert db_run is not None and db_run.status == "cancelled"
         assert all(job.status == "cancelled" for job in jobs)
+
+
+@pytest.mark.asyncio
+async def test_format_repair_stops_when_cancel_is_already_requested(monkeypatch):
+    await init_db()
+    async with SessionLocal() as session:
+        await session.execute(update(Job).where(Job.status.in_(["queued", "leased"])).values(status="done"))
+        project = Project(id=new_id(), name="cancel-repair", original_request="x")
+        session.add(project)
+        await session.flush()
+        run = Run(id=new_id(), project_id=project.id, status="running", cancel_requested=True)
+        session.add(run)
+        await session.commit()
+        rid = run.id
+    called = []
+
+    async def boom(self, *args, **kwargs):
+        called.append(1)
+        return {}, {}
+
+    monkeypatch.setattr(LLMProvider, "complete_json", boom)
+    async with SessionLocal() as session:
+        run = await session.get(Run, rid)
+        engine = Engine(session, SimpleNamespace(id="j", run_id=rid, step="verify", status="leased", last_error=""), "w")
+        with pytest.raises(StopForCancel):
+            await engine._repair_assessment(
+                run,
+                engine._llm(run),
+                prompt_name="verify_dataset",
+                user="{}",
+                previous_raw={},
+                spec=heuristic_parse("human atherosclerosis"),
+                evidence=[],
+                sample_dicts=[],
+                summary={},
+                coverage={"complete": True},
+                gse="GSE1",
+            )
+    assert called == []

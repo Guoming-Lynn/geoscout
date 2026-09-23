@@ -82,7 +82,7 @@ async function req<T>(path: string, init?: RequestInit & { timeoutMs?: number })
   } catch (err) {
     const name = err instanceof DOMException ? err.name : err instanceof Error ? err.name : "";
     if (name === "AbortError" || name === "TimeoutError") {
-      throw new Error("Local API did not respond. Start GEOScout.bat and retry.");
+    throw new Error("api_timeout");
     }
     throw err;
   }
@@ -125,8 +125,13 @@ export const api = {
   resume: (id: string) => req(`/api/runs/${id}/resume`, { method: "POST" }),
   cancel: (id: string) => req(`/api/runs/${id}/cancel`, { method: "POST" }),
   queries: (id: string) => req<{ term: string; round_no: number; hit_count: number | null; new_unique_gse: number; status: string; query_translation: string }[]>(`/api/runs/${id}/queries`),
-  datasets: (id: string, category?: string) =>
-    req<{ total: number; items: Record<string, unknown>[] }>(`/api/runs/${id}/datasets${category ? `?category=${category}` : ""}`),
+  datasets: (id: string, category?: string, offset = 0, limit = 50) => {
+    const params = new URLSearchParams();
+    if (category) params.set("category", category);
+    params.set("offset", String(offset));
+    params.set("limit", String(limit));
+    return req<{ total: number; items: Record<string, unknown>[] }>(`/api/runs/${id}/datasets?${params.toString()}`);
+  },
   dataset: (id: string, gse: string) => req<Record<string, unknown>>(`/api/runs/${id}/datasets/${gse}`),
   override: (id: string, gse: string, category: string, reason: string) =>
     req(`/api/runs/${id}/datasets/${gse}/override`, { method: "POST", body: JSON.stringify({ category, reason }) }),

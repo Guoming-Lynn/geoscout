@@ -8,4 +8,5 @@ COPY backend/tests/fixtures /app/tests/fixtures
 RUN pip install --no-cache-dir .
 ENV GEOSCOUT_HOST=127.0.0.1
 EXPOSE 8000
+# Image default is loopback. Compose publishes 0.0.0.0 inside the container and 127.0.0.1 on the host.
 CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]

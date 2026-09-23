@@ -85,7 +85,10 @@ def load_settings() -> Settings:
     settings = Settings()
     settings.ensure_dirs()
     token_path = settings.data_dir / ".internal_token"
-    if settings.internal_token:
+    if settings.embed_worker:
+        if not settings.internal_token:
+            settings.internal_token = secrets.token_urlsafe(32)
+    elif settings.internal_token:
         token_path.write_text(settings.internal_token, encoding="utf-8")
     elif token_path.exists():
         settings.internal_token = token_path.read_text(encoding="utf-8").strip()

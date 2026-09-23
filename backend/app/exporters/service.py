@@ -25,8 +25,12 @@ async def build_export_payload(session: AsyncSession, run: Run) -> dict[str, Any
     project = await session.get(Project, run.project_id)
     project_name = project.name if project else ""
     rds = (await session.execute(select(RunDataset).where(RunDataset.run_id == run.id))).scalars().all()
-    overrides = (await session.execute(select(Override).where(Override.run_id == run.id))).scalars().all()
-    over_map = {o.gse: o for o in overrides}
+    overrides = (
+        await session.execute(select(Override).where(Override.run_id == run.id).order_by(Override.created_at.asc(), Override.id.asc()))
+    ).scalars().all()
+    over_map: dict[str, Override] = {}
+    for item in overrides:
+        over_map[item.gse] = item
     candidates = []
     samples_out = []
     assessments_out = []

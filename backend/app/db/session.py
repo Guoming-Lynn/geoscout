@@ -56,6 +56,10 @@ def _migrate_sqlite_columns(sync_conn) -> None:  # type: ignore[no-untyped-def]
         "samples": [
             ("group_label", "ALTER TABLE samples ADD COLUMN group_label VARCHAR(200)"),
         ],
+        "runs": [
+            ("paused_total_s", "ALTER TABLE runs ADD COLUMN paused_total_s FLOAT DEFAULT 0"),
+            ("pause_started_at", "ALTER TABLE runs ADD COLUMN pause_started_at DATETIME"),
+        ],
     }
     for table, cols in needed.items():
         try:

@@ -48,7 +48,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(router)
-app.include_router(internal)
+if not settings.embed_worker:
+    app.include_router(internal)
 
 if settings.serve_web:
     built = web_dir()

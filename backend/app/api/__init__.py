@@ -22,6 +22,7 @@ from app.exporters.service import create_export
 from app.pipeline.assay import study_assay_kinds
 from app.pipeline.assessment import applicable_gsms, judgement_from_assessment, sample_record
 from app.pipeline.engine import parse_spec_with_optional_llm
+from app.pipeline.budget import note_resume
 from app.pipeline.repo import add_event, clear_workspace, dump, enqueue_job, load
 from app.pipeline.spec_parse import heuristic_parse, _fill_criteria
 from app.core.usage import add_usage
@@ -133,8 +134,16 @@ async def list_connection_models(
         return {"ok": False, "models": [], "message": str(exc)}
 
 
+OPEN_RUNS = {"queued", "running", "pausing", "paused", "waiting_for_credentials"}
+
+
 @router.post("/workspace/clear")
 async def clear_workspace_api(db: AsyncSession = Depends(get_session)) -> dict:
+    active = (
+        await db.execute(select(Run.id).where(Run.status.in_(OPEN_RUNS)).limit(1))
+    ).first()
+    if active:
+        raise HTTPException(409, "仍有未结束的任务。请先取消，再清除课题和运行记录。")
     deleted = await clear_workspace(db)
     await db.commit()
     return {"ok": True, "deleted": deleted}
@@ -323,6 +332,7 @@ async def resume_run(run_id: str, db: AsyncSession = Depends(get_session)) -> di
     if not run:
         raise HTTPException(404, "任务不存在")
     run.pause_requested = False
+    note_resume(run)
     if run.status in {"paused", "pausing", "waiting_for_credentials"}:
         run.status = "queued"
         run.stop_reason = ""
@@ -439,11 +449,11 @@ async def list_datasets(
     limit: int = 50,
     db: AsyncSession = Depends(get_session),
 ) -> dict:
-    stmt = select(RunDataset).where(RunDataset.run_id == run_id)
+    stmt = select(RunDataset, Dataset).outerjoin(Dataset, Dataset.gse == RunDataset.gse).where(RunDataset.run_id == run_id)
     if category:
         stmt = stmt.where(RunDataset.category == category)
-    rows = (await db.execute(stmt)).scalars().all()
-    gse_ids = [rd.gse for rd in rows]
+    joined = (await db.execute(stmt)).all()
+    gse_ids = [rd.gse for rd, _ds in joined]
     sample_stubs: dict[str, list[dict]] = {}
     if gse_ids:
         sample_rows = (
@@ -453,8 +463,7 @@ async def list_datasets(
             if strategy:
                 sample_stubs.setdefault(gse, []).append({"library_strategy": strategy})
     items = []
-    for rd in rows:
-        ds = await db.get(Dataset, rd.gse)
+    for rd, ds in joined:
         title = ds.title if ds else ""
         if q and q.lower() not in (rd.gse + title).lower():
             continue
@@ -502,8 +511,12 @@ async def dataset_detail(run_id: str, gse: str, db: AsyncSession = Depends(get_s
     ).scalars().all()
     evidence = await evidence_bundle(db, run_id, rd.gse)
     ov = (
-        await db.execute(select(Override).where(Override.run_id == run_id, Override.gse == rd.gse))
-    ).scalar_one_or_none()
+        await db.execute(
+            select(Override)
+            .where(Override.run_id == run_id, Override.gse == rd.gse)
+            .order_by(Override.created_at.desc(), Override.id.desc())
+        )
+    ).scalars().first()
     run = await db.get(Run, run_id)
     run_spec = ResearchSpec.model_validate(load(run.spec_snapshot, {})) if run else ResearchSpec()
     hard_ids = {c.criterion_id for c in run_spec.inclusion_criteria if c.priority == "hard"}
@@ -605,11 +618,22 @@ async def override_dataset(run_id: str, gse: str, body: OverrideIn, db: AsyncSes
     ).scalar_one_or_none()
     if not rd:
         raise HTTPException(404, "结果不存在")
+    run = await db.get(Run, run_id)
+    if run and run.status in {"queued", "running", "pausing"}:
+        raise HTTPException(409, "任务仍在运行。暂停或结束后再覆盖分类。")
+    previous = (
+        await db.execute(
+            select(Override)
+            .where(Override.run_id == run_id, Override.gse == rd.gse)
+            .order_by(Override.created_at.asc(), Override.id.asc())
+        )
+    ).scalars().first()
+    machine_category = previous.previous_category if previous else rd.category
     item = Override(
         id=new_id(),
         run_id=run_id,
         gse=rd.gse,
-        previous_category=rd.category,
+        previous_category=machine_category,
         new_category=body.category,
         reason=body.reason,
     )

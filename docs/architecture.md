@@ -7,4 +7,6 @@ Launcher or Vite UI → FastAPI (`127.0.0.1:8000`) → SQLite WAL + job rows →
 
 The model never executes tools or shell commands. A state machine chooses the next step; model output is schema-checked JSON.
 
-Credential store lives in the API process. A separate worker may fetch them only from `/internal/credentials/{session_id}` with a localhost token stored in `data/.internal_token`.
+Credential store lives in the API process. A separate worker may fetch them only from `/internal/credentials/{session_id}` with a localhost token stored in `data/.internal_token`. The double-click launcher embeds the worker, so that route is not mounted and the token file is not written.
+
+The UI polls run, dataset, and query endpoints. `GET /api/runs/{id}/events` remains a server-sent event stream for those same log rows.

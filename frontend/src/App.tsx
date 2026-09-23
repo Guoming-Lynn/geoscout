@@ -16,6 +16,12 @@ import { LanguageSelect, useI18n, type MsgKey } from "./i18n";
 import { nextRunId, runOwnedByProject, totalTokens } from "./testable";
 
 const LIVE_STATUSES = ["queued", "running", "pausing", "waiting_for_credentials"] as const;
+const PAGE_SIZE = 50;
+
+function explainError(t: (key: MsgKey) => string, err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  return message === "api_timeout" ? t("apiTimeout") : message;
+}
 
 function isLive(status?: string) {
   return !!status && LIVE_STATUSES.includes(status as (typeof LIVE_STATUSES)[number]);
@@ -52,6 +58,7 @@ export default function App() {
   const [runId, setRunId] = useState<string | null>(null);
   const [spec, setSpec] = useState<ResearchSpec>(emptySpec);
   const [tab, setTab] = useState<"recommended" | "needs_review" | "excluded">("needs_review");
+  const [page, setPage] = useState(0);
   const [selected, setSelected] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window !== "undefined" && window.matchMedia("(min-width: 901px)").matches);
@@ -93,8 +100,8 @@ export default function App() {
   });
   const liveRun = isLive(run.data?.status);
   const datasets = useQuery({
-    queryKey: ["datasets", runId, tab],
-    queryFn: () => api.datasets(runId!, tab),
+    queryKey: ["datasets", runId, tab, page],
+    queryFn: () => api.datasets(runId!, tab, page * PAGE_SIZE, PAGE_SIZE),
     enabled: !!runId,
     refetchInterval: liveRun ? 2000 : false,
   });
@@ -120,6 +127,9 @@ export default function App() {
       setSelected(null);
     }
   }, [projectId, runs.data, runs.isFetching, runId]);
+  useEffect(() => {
+    setPage(0);
+  }, [runId, tab]);
   const detail = useQuery({
     queryKey: ["detail", runId, selected],
     queryFn: () => api.dataset(runId!, selected!),
@@ -143,12 +153,12 @@ export default function App() {
       setSelected(null);
       qc.invalidateQueries({ queryKey: ["projects"] });
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => setError(explainError(t, e)),
   });
   const parseSpec = useMutation({
     mutationFn: () => api.parseSpec(projectId!),
     onSuccess: (r) => { setSpec(r.spec); qc.invalidateQueries({ queryKey: ["projects"] }); },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => setError(explainError(t, e)),
   });
   const startRun = useMutation({
     mutationFn: async (body: Record<string, unknown>) => {
@@ -163,7 +173,7 @@ export default function App() {
       qc.invalidateQueries({ queryKey: ["queries"] });
       qc.invalidateQueries({ queryKey: ["datasets"] });
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => setError(explainError(t, e)),
   });
 
   const current: RunView | undefined = run.data && runOwnedByProject(run.data, projectId) ? run.data : undefined;
@@ -244,7 +254,7 @@ export default function App() {
                   }
                   qc.invalidateQueries({ queryKey: ["connections"] });
                 } catch (e) {
-                  setError((e as Error).message);
+                  setError(explainError(t, e));
                 }
               }}
             >
@@ -271,7 +281,7 @@ export default function App() {
                 qc.invalidateQueries({ queryKey: ["projects"] });
                 qc.invalidateQueries({ queryKey: ["runs"] });
               } catch (e) {
-                setError((e as Error).message);
+                setError(explainError(t, e));
               }
             }}
           >
@@ -415,7 +425,7 @@ export default function App() {
                   await api.pause(current.id);
                   await qc.invalidateQueries({ queryKey: ["run", current.id] });
                 } catch (e) {
-                  setError(e instanceof Error ? e.message : String(e));
+                  setError(explainError(t, e));
                 }
               }}><Pause size={14} /> {t("pause")}</button>
               <button className="secondary" disabled={current.status !== "paused" && current.status !== "pausing"} onClick={async () => {
@@ -424,7 +434,7 @@ export default function App() {
                   await api.resume(current.id);
                   await qc.invalidateQueries({ queryKey: ["run", current.id] });
                 } catch (e) {
-                  setError(e instanceof Error ? e.message : String(e));
+                  setError(explainError(t, e));
                 }
               }}><Play size={14} /> {t("resume")}</button>
               <button className="bad" disabled={!isLive(current.status) && current.status !== "paused"} onClick={async () => {
@@ -433,7 +443,7 @@ export default function App() {
                   await api.cancel(current.id);
                   await qc.invalidateQueries({ queryKey: ["run", current.id] });
                 } catch (e) {
-                  setError(e instanceof Error ? e.message : String(e));
+                  setError(explainError(t, e));
                 }
               }}>{t("cancel")}</button>
               <button
@@ -443,7 +453,7 @@ export default function App() {
                     const exp = await api.exportRun(current.id);
                     window.location.href = exp.download;
                   } catch (e) {
-                    setError(e instanceof Error ? e.message : String(e));
+                    setError(explainError(t, e));
                   }
                 }}
               >
@@ -495,8 +505,19 @@ export default function App() {
                 </tbody>
               </table>
               {(datasets.data?.items || []).length === 0 && <p className="muted">{t("noCandidates")}</p>}
+              {(datasets.data?.total || 0) > PAGE_SIZE && (
+                <div className="row">
+                  <button className="secondary" disabled={page === 0} onClick={() => setPage((n) => Math.max(0, n - 1))}>{t("prevPage")}</button>
+                  <span className="muted">{t("pageStatus", {
+                    from: String((datasets.data?.total || 0) === 0 ? 0 : page * PAGE_SIZE + 1),
+                    to: String(Math.min(datasets.data?.total || 0, (page + 1) * PAGE_SIZE)),
+                    total: String(datasets.data?.total || 0),
+                  })}</span>
+                  <button className="secondary" disabled={(page + 1) * PAGE_SIZE >= (datasets.data?.total || 0)} onClick={() => setPage((n) => n + 1)}>{t("nextPage")}</button>
+                </div>
+              )}
             </div>
-            {detail.data && <div className="detail-drawer" role="dialog" aria-label={t("detail")}><button className="drawer-close secondary" onClick={() => setSelected(null)} aria-label={t("close")}>×</button><Detail data={detail.data} runId={current.id} onOverride={() => qc.invalidateQueries({ queryKey: ["datasets", runId] })} /></div>}
+            {detail.data && <div className="detail-drawer" role="dialog" aria-label={t("detail")}><button className="drawer-close secondary" onClick={() => setSelected(null)} aria-label={t("close")}>×</button><Detail data={detail.data} runId={current.id} busy={["queued", "running", "pausing"].includes(current.status)} onError={(message) => setError(explainError(t, new Error(message)))} onOverride={() => qc.invalidateQueries({ queryKey: ["datasets", runId] })} /></div>}
           </section>
         )}
       </main>
@@ -552,7 +573,7 @@ function SpecEditor({ spec, onChange }: { spec: ResearchSpec; onChange: (s: Rese
   );
 }
 
-function Detail({ data, runId, onOverride }: { data: Record<string, unknown>; runId: string; onOverride: () => void }) {
+function Detail({ data, runId, busy, onError, onOverride }: { data: Record<string, unknown>; runId: string; busy: boolean; onError: (message: string) => void; onOverride: () => void }) {
   const { t } = useI18n();
   const ds = (data.dataset ?? {}) as Record<string, unknown>;
   const rd = data.run_dataset as Record<string, unknown>;
@@ -585,6 +606,7 @@ function Detail({ data, runId, onOverride }: { data: Record<string, unknown>; ru
         ))}
       </ul>
       <h4>{t("samples")}（{samples.length}）</h4>
+      {samples.length > 50 && <p className="muted">{t("samplePreview", { shown: "50", total: String(samples.length) })}</p>}
       <div className="table-wrap">
         <table>
           <thead><tr><th>GSM</th><th>{t("title")}</th><th>{t("organism")}</th><th>{t("donor")}</th></tr></thead>
@@ -597,8 +619,8 @@ function Detail({ data, runId, onOverride }: { data: Record<string, unknown>; ru
       </div>
       <div className="row">
         <input value={reason} onChange={(e) => setReason(e.target.value)} aria-label={t("overrideReason")} />
-        <button className="secondary" onClick={async () => { await api.override(runId, String(data.gse), "recommended", reason); onOverride(); }}>{t("markRecommended")}</button>
-        <button className="secondary" onClick={async () => { await api.override(runId, String(data.gse), "excluded", reason); onOverride(); }}>{t("markExcluded")}</button>
+        <button className="secondary" disabled={busy} onClick={async () => { try { await api.override(runId, String(data.gse), "recommended", reason); onOverride(); } catch (e) { onError(e instanceof Error ? e.message : String(e)); } }}>{t("markRecommended")}</button>
+        <button className="secondary" disabled={busy} onClick={async () => { try { await api.override(runId, String(data.gse), "excluded", reason); onOverride(); } catch (e) { onError(e instanceof Error ? e.message : String(e)); } }}>{t("markExcluded")}</button>
       </div>
     </div>
   );
