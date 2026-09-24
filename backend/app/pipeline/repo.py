@@ -97,6 +97,7 @@ async def claim_job(session: AsyncSession, worker_id: str, lease_s: int) -> Job 
             job.last_error = "任务已结束"
             job.updated_at = now
             continue
+        _credit_idle(run, job, now)
         job.status = "leased"
         job.worker_id = worker_id
         job.attempt += 1
@@ -104,6 +105,20 @@ async def claim_job(session: AsyncSession, worker_id: str, lease_s: int) -> Job 
         job.updated_at = now
         return job
     return None
+
+
+def _credit_idle(run: Run, job: Job, now: datetime) -> None:
+    """Queue waits and dead-worker leases are not the run's own work; keep them off the runtime budget."""
+    if run.started_at is None or run.pause_started_at is not None:
+        return
+    last = job.updated_at or job.created_at
+    if last is None:
+        return
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    idle = (now - last).total_seconds()
+    if idle > 0:
+        run.paused_total_s = float(run.paused_total_s or 0) + idle
 
 
 async def heartbeat(session: AsyncSession, job: Job, lease_s: int) -> None:

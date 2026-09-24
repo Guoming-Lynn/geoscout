@@ -337,10 +337,13 @@ async def resume_run(run_id: str, db: AsyncSession = Depends(get_session)) -> di
         run.status = "queued"
         run.stop_reason = ""
         jobs = (await db.execute(select(Job).where(Job.run_id == run.id))).scalars().all()
+        now = datetime.now(timezone.utc)
         for job in jobs:
             if job.status == "waiting_credentials":
                 job.status = "queued"
                 job.last_error = ""
+            if job.status == "queued":
+                job.updated_at = now
         has_work = any(job.status in {"queued", "leased"} for job in jobs)
         if not has_work:
             await enqueue_job(db, run.id, _resume_step(run))

@@ -182,12 +182,17 @@ def deep_target_span(cap: int) -> int:
     return 0 if cap <= 0 else cap * 2
 
 
+def deep_download_ceiling(cap: int) -> int:
+    """Hard limit on SOFT downloads when backfilling past the preselected span."""
+    return 0 if cap <= 0 else cap * 4
+
+
 def walk_deep_slots(gated: list[bool], cap: int) -> tuple[int, int]:
     """Model assessments and SOFT downloads. Stop once the model cap is filled."""
     assessed = downloaded = 0
     if cap <= 0:
         return 0, 0
-    for is_gated in gated[: deep_target_span(cap)]:
+    for is_gated in gated[: deep_download_ceiling(cap)]:
         if assessed >= cap:
             break
         downloaded += 1

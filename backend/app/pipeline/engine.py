@@ -35,7 +35,7 @@ from app.pipeline.assessment import (
 from app.pipeline.budget import BudgetStop, check_before_external, estimate_tokens, note_pause, review_token_reserve
 from app.pipeline.donors import donors_per_group, infer_group_label
 from app.pipeline.query_planner import plan_queries
-from app.pipeline.ranking import deep_target_span, relevance, select_deep_targets
+from app.pipeline.ranking import deep_download_ceiling, deep_target_span, relevance, select_deep_targets
 from app.pipeline.source import sorted_fraction
 from app.pipeline.repo import (
     add_event,
@@ -481,6 +481,23 @@ class Engine:
         else:
             await enqueue_job(self.session, run.id, "deep_fetch")
 
+    def _backfill_targets(self, rows: list[RunDataset], checkpoint: dict[str, Any], limit: int) -> list[str]:
+        taken = set(checkpoint.get("deep_targets") or [])
+        pool = sorted(
+            (r for r in rows if r.gse not in taken and r.verification_status != "rule_excluded"),
+            key=lambda r: (-load(r.first_assess_json, {}).get("selection", {}).get("score", 0), r.gse),
+        )[: max(0, limit)]
+        rank = len(taken)
+        for row in pool:
+            rank += 1
+            first = load(row.first_assess_json, {})
+            selection = first.setdefault("selection", {})
+            selection["selected"] = True
+            selection["rank"] = rank
+            selection["backfill"] = True
+            row.first_assess_json = dump(first)
+        return [r.gse for r in pool]
+
     async def step_deep_fetch(self, run: Run) -> None:
         run.stage = "fetching"
         budget = self._budget(run)
@@ -505,6 +522,14 @@ class Engine:
         payload = load(self.job.payload_json, {})
         index = int(payload.get("index") or 0)
         deep_done = int(load(run.counters_json, {}).get("deep_done") or 0)
+        cap = budget.max_deep_verify
+        if index >= len(targets) and 0 < cap and deep_done < cap and len(targets) < deep_download_ceiling(cap):
+            extra = self._backfill_targets(rows, checkpoint, min(cap - deep_done, deep_download_ceiling(cap) - len(targets)))
+            if extra:
+                checkpoint["deep_targets"] = checkpoint["deep_targets"] + extra
+                run.checkpoint_json = dump(checkpoint)
+                targets += [by_gse[g] for g in extra]
+                await add_event(self.session, run.id, f"规则闸门占用深核名额，补充 {len(extra)} 条候选")
         if index >= len(targets) or (budget.max_deep_verify > 0 and deep_done >= budget.max_deep_verify):
             unfetched = max(0, len(targets) - index)
             not_selected = max(0, len(rows) - len(targets))
@@ -1276,6 +1301,22 @@ def _activity_mix_note(cohort: list[dict[str, Any]], labels: dict[str, str]) -> 
     return ""
 
 
+def _case_only_note(
+    samples: list[dict[str, Any]],
+    spec: ResearchSpec | None,
+    merged: list[CriterionJudgement] | None,
+) -> str:
+    if spec is None or not merged or not samples or "control" not in (spec.required_groups or []):
+        return ""
+    groups = next((item for item in merged if item.criterion_id == "groups"), None)
+    if groups is None or groups.verdict == "pass":
+        return ""
+    labels = {infer_group_label(sample, spec=spec) for sample in samples}
+    if not labels or not labels <= {"case", "lesion", "disease"}:
+        return ""
+    return "系列只有病例样本、没有对照组：可做病例内部分析，不能直接做病例-对照比较。"
+
+
 def _annotate_reason(
     reason: str,
     rd: RunDataset,
@@ -1289,6 +1330,9 @@ def _annotate_reason(
     text = reason or ""
     cohort_samples: list[dict[str, Any]] = []
     note = mixed_omics_note(summary, samples)
+    if note and note not in text:
+        extra.append(note)
+    note = _case_only_note(samples, spec, merged)
     if note and note not in text:
         extra.append(note)
     if spec is not None and merged:

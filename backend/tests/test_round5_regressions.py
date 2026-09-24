@@ -215,6 +215,42 @@ def test_deep_backfill_stops_at_the_model_cap():
     gated = [True] * 12 + [False] * 8
     assert walk_deep_slots(gated, 10) == (8, 20)
     assert walk_deep_slots([True] * 5 + [False] * 15, 10) == (10, 15)
+    # Round 6 BRCA: 15 of the first 20 gated; backfill must keep filling model slots.
+    assert walk_deep_slots([True] * 15 + [False] * 5 + [False] * 10, 10) == (10, 25)
+    assert walk_deep_slots([True] * 50, 10) == (0, 40)
+
+
+def test_queue_wait_and_dead_lease_are_not_runtime():
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from app.pipeline.budget import active_elapsed_s
+    from app.pipeline.repo import _credit_idle
+
+    now = datetime.now(timezone.utc)
+    run = SimpleNamespace(started_at=now - timedelta(seconds=5000), paused_total_s=0.0, pause_started_at=None)
+    job = SimpleNamespace(updated_at=now - timedelta(seconds=3000), created_at=now - timedelta(seconds=3100))
+    _credit_idle(run, job, now)
+    assert abs(active_elapsed_s(run, now) - 2000) < 1
+
+    paused = SimpleNamespace(started_at=now - timedelta(seconds=5000), paused_total_s=0.0, pause_started_at=now)
+    _credit_idle(paused, job, now)
+    assert paused.paused_total_s == 0.0
+
+
+def test_case_only_series_is_named_in_the_reason():
+    from app.pipeline.engine import _case_only_note
+
+    spec = heuristic_parse("human primary breast cancer single-cell RNA-seq with disease and control")
+    cases = [
+        {"gsm": f"GSM{i}", "characteristics": [{"key": "disease", "value": "breast cancer"}]} for i in range(3)
+    ]
+    groups = CriterionJudgement(criterion_id="groups", verdict="unknown", reason="", judge_source="rule")
+    assert "没有对照组" in _case_only_note(cases, spec, [groups])
+    mixed = cases + [{"gsm": "GSM9", "characteristics": [{"key": "disease", "value": "normal"}]}]
+    assert _case_only_note(mixed, spec, [groups]) == ""
+    passed = groups.model_copy(update={"verdict": "pass"})
+    assert _case_only_note(cases, spec, [passed]) == ""
 
 
 def test_cohort_reason_uses_real_samples():
