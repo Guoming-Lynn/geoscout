@@ -80,7 +80,7 @@ _TISSUE_RULES: list[tuple[str, str]] = [
     ("plaque", r"斑块|\bplaque\b|\batheroma\b"),
     ("synovium", r"滑膜|\bsynovi(?:um|al)\b"),
     ("skeletal muscle", r"骨骼肌|skeletal muscle"),
-    ("intestine", r"肠组织|肠道组织|intestinal tissue|colon tissue|\bcolon\b|intestin"),
+    ("intestine", r"肠组织|肠道组织|intestinal tissue|colon tissue|\bcolon\b|intestin|rect(?:um|al)|colorectal"),
     ("liver", r"肝脏|肝组织|\bliver\b|\bhepatic\b"),
     ("kidney", r"肾脏|肾组织|\bkidney\b|\brenal\b"),
     ("lung", r"肺组织|\blung\b"),
@@ -89,11 +89,23 @@ _TISSUE_RULES: list[tuple[str, str]] = [
     ("blood", r"全血|外周血|whole blood|peripheral blood|\bblood\b"),
 ]
 _NONRNA_ASSAYS = {"spatial_transcriptomics", "proteomics", "epigenomics", "microbiome"}
-_PRIMARY_MATERIAL = (
-    r"tissue|samples?|biops(?:y|ies)|pbmc|whole blood|peripheral blood|"
-    r"plaque|islets?|brain|cortex|hippocampus|"
-    r"组织|样本|斑块|胰岛|脑|外周血|全血"
-)
+def _primary_material() -> str:
+    """Tissue names count as primary material, not only brain/islet/PBMC."""
+    terms: set[str] = set()
+    for key, values in TISSUE_SYNONYMS.items():
+        terms.add(key)
+        terms.update(values)
+    terms.update({
+        "tissue", "tissues", "sample", "samples", "biopsy", "biopsies",
+        "tumor", "tumour", "tumors", "tumours", "resection", "resections",
+        "surgical", "patient", "patients", "donor", "donors", "cohort",
+        "组织", "样本", "斑块",
+    })
+    ordered = sorted((term for term in terms if term), key=len, reverse=True)
+    return "|".join(re.escape(term) for term in ordered)
+
+
+_PRIMARY_MATERIAL = _primary_material()
 _ASKS_PRIMARY = re.compile(
     rf"直接.{{0,16}}(?:患者|病人).{{0,8}}样本|"
     rf"原代.{{0,16}}(?:{_PRIMARY_MATERIAL})|"

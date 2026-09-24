@@ -17,7 +17,7 @@ sample_source 是硬性来源条件：primary 要求直接采集的原代组织/
 - 在对应课题中，T2D/T2DM 可对应 2 型糖尿病，RA 可对应类风湿，AD/sAD/LOAD/EOAD 可对应阿尔茨海默病。须用样本 diagnosis/disease state/subject status 等原始字段确认，不得把任何 patient 或其它疾病患者自动算作目标病例。
 - samples.group_label 与 group_inventory 是程序推导的辅助信息。group_label 为空不等于该组不存在；要回到原始样本标签检查。不得引用推导标签作为来源原文，不得把 gsm_counts 当作独立供体数。
 - Control/T2D、Healthy/Rheumatoid arthritis 等标签在原始样本证据支持时可以满足 case/control。不得因为原文没有 case 或 lesion 这个单词而判 unknown。WT、vehicle、untreated、治疗前后不自动等于健康对照；康复和急性感染需按课题实际要求区分。
-- 疾病与对照比较时，接受过体外刺激、药物、抑制剂、敲低等处理的样本不是基线病例或对照，不得列入 groups 的 qualifying_gsms；同一供体的多个处理样本只算一个供体。患者的临床用药不属于体外处理。
+- 疾病与对照比较时，接受过体外刺激、药物、抑制剂、敲低等处理的样本不是基线病例或对照，不得列入 groups 的 qualifying_gsms；同一供体的多个处理样本只算一个供体。患者的临床用药不属于体外处理。member_gsms 中的全部样本都计入该组人数，不要只数代表样本。
 - groups 判 pass 时，必须列出属于所需各组的 qualifying_gsms，并分别引用病例和对照的原始样本 evidence_id 及 quotes。仅引摘要中的“有对照”不足以替代样本映射。
 - 样本按分组交替排列，不是病情或重要性排序。sample_coverage.complete=false 表示仍有记录未展示；group_inventory 只帮助解释覆盖缺口，不能替代未展示样本的证据或解除完整性限制。
 - unknown 的原因要明确区分：原始字段缺失、只有非目标对照、病例状态定义不清、样本输入截断、未能确定同一可用子集。不要仅重复“没有 lesion 标签”。

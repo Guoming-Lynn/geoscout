@@ -4,7 +4,7 @@ from typing import Any
 
 from app.pipeline.assessment import ABSTRACT_CANNOT_FAIL
 from app.pipeline.assay import TYPED_NONRNA, assay_method_relation, assay_relation, infer_sample_assay, infer_study_assay, sample_method_relation
-from app.pipeline.donors import donor_criterion_judgement, infer_group_label
+from app.pipeline.donors import LESION_GROUP_NAMES, donor_criterion_judgement, infer_group_label
 from app.pipeline.lexicon import lexicon_terms
 from app.pipeline.source import sample_tissue_conflicts, source_kind, tissue_matches
 from app.pipeline.spec_parse import disease_parse_incomplete
@@ -66,7 +66,7 @@ def _judge_one(
     if field == "assay_method":
         return _assay_method(criterion, spec, summary, samples)
     if field == "disease":
-        return _keyword(criterion, text, _disease_seeds(spec), hard_fail=False)
+        return _disease_from_samples(criterion, spec, samples, text)
     if field == "tissue":
         return _tissue(criterion, spec, samples, text)
     if field == "sample_source":
@@ -539,13 +539,62 @@ def _tissue(criterion: Criterion, spec: ResearchSpec, samples: list[dict[str, An
     )
 
 
+def _disease_from_samples(
+    criterion: Criterion,
+    spec: ResearchSpec,
+    samples: list[dict[str, Any]],
+    text: str,
+) -> CriterionJudgement:
+    cases = [sample for sample in samples if infer_group_label(sample, spec=spec) in LESION_GROUP_NAMES]
+    if cases:
+        support = ""
+        for row in cases[0].get("characteristics") or []:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key") or "").casefold()
+            if any(part in key for part in ("status", "diagnos", "group", "condition", "disease", "phenotype")):
+                support = str(row.get("value") or "")
+                if support:
+                    break
+        if not support:
+            support = str(cases[0].get("title") or cases[0].get("source_name") or (spec.disease[:1] or [""])[0])
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="pass",
+            reason="样本分组字段标出了目标疾病病例。",
+            judge_source="rule",
+            support_text=support,
+            qualifying_gsms=[str(sample.get("gsm") or "") for sample in cases if sample.get("gsm")],
+        )
+    return _keyword(criterion, text, _disease_seeds(spec), hard_fail=False)
+
+
 def _sample_source(criterion: Criterion, spec: ResearchSpec, samples: list[dict[str, Any]]) -> CriterionJudgement:
-    matching = [s for s in samples if source_kind(s) == spec.sample_source]
+    model_kinds = {"cell_line", "xenograft", "organoid"}
+    wanted = spec.sample_source
+    kinds = [source_kind(sample) for sample in samples]
+    if wanted == "primary" and samples and all(kind in model_kinds for kind in kinds):
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="fail",
+            reason=f"全部样本来自{kinds[0]}，不是原代材料。",
+            judge_source="rule",
+            support_text=str(samples[0].get("source_name") or kinds[0] or ""),
+        )
+    if wanted in model_kinds and samples and all(kind == "primary" for kind in kinds):
+        return CriterionJudgement(
+            criterion_id=criterion.criterion_id,
+            verdict="fail",
+            reason="全部样本是原代材料，不是所要求的模型来源。",
+            judge_source="rule",
+            support_text=str(samples[0].get("source_name") or "primary"),
+        )
+    matching = [sample for sample in samples if source_kind(sample) == wanted]
     if matching:
         return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="pass",
             reason=f"样本字段支持 {spec.sample_source} 来源。", judge_source="rule",
             support_text=str(matching[0].get("source_name") or spec.sample_source),
-            qualifying_gsms=[str(s.get("gsm") or "") for s in matching if s.get("gsm")])
+            qualifying_gsms=[str(sample.get("gsm") or "") for sample in matching if sample.get("gsm")])
     return CriterionJudgement(criterion_id=criterion.criterion_id, verdict="unknown",
         reason="样本字段未明确证明所需来源。", judge_source="rule", clue_only=True)
 

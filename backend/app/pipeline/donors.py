@@ -52,6 +52,14 @@ DISEASE_LABELS = {
     "type 2 diabetes": ["T2D", "T2DM", "type 2 diabetic", "T2 diabetic", "diabetic"],
     "rheumatoid arthritis": ["RA", "Rheumatiod arthritis", "rhematoid arthritis"],
     "COVID-19": ["COVID", "COVID19", "SARS-CoV-2"],
+    "ulcerative colitis": ["UC", "active UC", "inactive UC", "UC active", "UC inactive", "ulcerative colitis"],
+    "Crohn's disease": ["CD", "Crohn", "Crohns", "Crohn's"],
+    "inflammatory bowel disease": ["IBD"],
+    "breast cancer": ["BC", "BRCA", "TNBC", "IDC", "ILC", "HR+", "HER2+", "ER+", "DCIS", "tumor", "tumour"],
+}
+# Requesting the parent also accepts its child diseases as cases.
+DISEASE_CHILDREN = {
+    "inflammatory bowel disease": ["ulcerative colitis", "Crohn's disease"],
 }
 # Exact folded values on a group-like field. Not matched as substrings.
 DISEASE_CONTROL_LABELS = {
@@ -63,6 +71,19 @@ DISEASE_CONTROL_LABELS = {
         "ngt",
         "normoglycemic",
         "normal glucose tolerance",
+    ],
+    "ulcerative colitis": ["non ibd", "non-ibd", "nonibd", "non ibd control", "non-ibd control", "hc", "healthy"],
+    "Crohn's disease": ["non ibd", "non-ibd", "nonibd", "non ibd control", "non-ibd control", "hc", "healthy"],
+    "inflammatory bowel disease": ["non ibd", "non-ibd", "nonibd", "non ibd control", "non-ibd control", "hc", "healthy"],
+    "breast cancer": [
+        "normal",
+        "normal breast",
+        "normal tissue",
+        "adjacent normal",
+        "tumor adjacent normal",
+        "reduction mammoplasty",
+        "mammoplasty",
+        "healthy breast",
     ],
 }
 _GROUP_KEY_PARTS = ("status", "diagnos", "group", "condition", "disease", "phenotype", "cohort", "state")
@@ -106,7 +127,19 @@ _BASELINE_TREATMENT = {
     "n a",
     "na",
     "control medium",
+    "no strain",
+    "unstrained",
+    "static",
+    "sham",
+    "mock",
+    "control",
 }
+_CLINICAL_DRUG = re.compile(
+    r"methotrexate|infliximab|adalimumab|vedolizumab|ustekinumab|azathioprine|"
+    r"mesalamine|prednisolone|prednisone|steroid|insulin|metformin",
+    re.I,
+)
+_BASELINE_PREFIX = re.compile(r"^(?:no|without|un|non)(?:\s|$)")
 _EXVIVO_RE = re.compile(
     r"\blps\b|il[\s\-]?\d+|tnf|ifn|pma|ionomycin|anti[\s\-]?cd3|cd3/cd28|cpg|poly\s*\(?i:c|"
     r"stimulat|inhibitor|agonist|antagonist|sirna|shrna|knock ?down|dmso|vehicle|"
@@ -176,14 +209,12 @@ def parse_sample_traits(sample: dict[str, Any], *, spec: ResearchSpec | None = N
     if not texts:
         return acc
     terms = [t.term for t in lexicon_terms("disease", spec.disease)] + spec.disease if spec is not None else []
-    aliases = [alias for disease in (spec.disease if spec else []) for name, labels in DISEASE_LABELS.items()
-               if disease.casefold() == name.casefold() for alias in labels]
+    requested = _requested_disease_names(spec)
+    aliases = [alias for name in requested for alias in DISEASE_LABELS.get(name, [])]
     disease_controls = {
         _fold(label)
-        for disease in (spec.disease if spec else [])
-        for name, labels in DISEASE_CONTROL_LABELS.items()
-        if disease.casefold() == name.casefold()
-        for label in labels
+        for name in requested
+        for label in DISEASE_CONTROL_LABELS.get(name, [])
     }
     for key, text in texts:
         folded = _fold(text)
@@ -195,7 +226,10 @@ def parse_sample_traits(sample: dict[str, Any], *, spec: ResearchSpec | None = N
             if key in {"genotype", "treatment"}:
                 piece.pop("health", None)
                 piece.pop("control_token", None)
-            if grouped and folded in disease_controls:
+            if grouped and _other_disease_label(folded, requested):
+                piece.pop("disease_state", None)
+                piece.pop("health", None)
+            elif grouped and folded in disease_controls:
                 piece.update(control_token=True, disease_state="absent")
             else:
                 targets = terms + [a for a in aliases if grouped or len(_fold(a)) >= 5]
@@ -345,13 +379,55 @@ def _is_treatment_key(key: str) -> bool:
 
 def _treatment_kind(value: str) -> str | None:
     folded = _fold(value)
-    if folded in _BASELINE_TREATMENT:
+    if not folded:
+        return None
+    if _looks_like_group_value(folded):
+        return None
+    if folded in _BASELINE_TREATMENT or _BASELINE_PREFIX.match(folded):
         return "untreated"
-    if re.search(r"therap|dmard|medication|clinical", value, re.I):
+    if re.search(r"therap|dmard|medication|clinical|prior|history", value, re.I):
+        return None
+    if _CLINICAL_DRUG.search(value):
         return None
     if _EXVIVO_RE.search(value):
         return "ex_vivo"
-    return None
+    return "ex_vivo"
+
+
+def _requested_disease_names(spec: ResearchSpec | None) -> list[str]:
+    if spec is None:
+        return []
+    names: list[str] = []
+    for disease in spec.disease:
+        canon = next((name for name in DISEASE_LABELS if name.casefold() == disease.casefold()), disease)
+        names.append(canon)
+        names.extend(DISEASE_CHILDREN.get(canon, []))
+    return names
+
+
+def _other_disease_label(folded: str, requested: list[str]) -> bool:
+    requested_folded = {name.casefold() for name in requested}
+    for name, labels in DISEASE_LABELS.items():
+        if name.casefold() in requested_folded:
+            continue
+        if _has_word(folded, name) or any(
+            _has_word(folded, label) and (len(_fold(label)) >= 5 or folded == _fold(label))
+            for label in labels
+        ):
+            return True
+    return False
+
+
+def _looks_like_group_value(folded: str) -> bool:
+    if folded in _CONTROL_EXACT or folded in {"healthy", "normal", "case", "lesion"}:
+        return True
+    for labels in DISEASE_LABELS.values():
+        if any(folded == _fold(label) for label in labels):
+            return True
+    for labels in DISEASE_CONTROL_LABELS.values():
+        if folded in {_fold(label) for label in labels}:
+            return True
+    return False
 
 
 def _fold(value: str) -> str:

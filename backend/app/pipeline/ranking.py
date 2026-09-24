@@ -20,6 +20,7 @@ _OFF_TARGET = {
     "kidney": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
     "synovium": ["blood", "pbmc", "brain", "muscle", "adipose"],
     "skeletal muscle": ["blood", "pbmc", "brain", "synovial", "adipose"],
+    "breast": ["blood", "pbmc", "lung", "liver", "brain", "bone", "bone marrow", "lymph node", "pleural effusion", "ascites", "skin", "ovary", "colon"],
 }
 _MATERIAL = ["biopsy", "biopsies", "postmortem", "tissue", "islet", "islets", "pbmc", "cortex",
              "hippocampus", "dentate", "blood draw", "patient"]
@@ -174,6 +175,25 @@ def _assay_mismatch_penalty(
 def _title_terms(summary: dict[str, Any]) -> set[str]:
     stop = {"the", "of", "and", "in", "a", "an", "on", "with", "by", "for", "to", "rna", "seq"}
     return {t for t in _normal(str(summary.get("title") or "")).split() if t not in stop and len(t) > 2}
+
+
+def deep_target_span(cap: int) -> int:
+    """SOFT candidates to preselect: the model cap, plus an equal reserve for rule-gated rows."""
+    return 0 if cap <= 0 else cap * 2
+
+
+def walk_deep_slots(gated: list[bool], cap: int) -> tuple[int, int]:
+    """Model assessments and SOFT downloads. Stop once the model cap is filled."""
+    assessed = downloaded = 0
+    if cap <= 0:
+        return 0, 0
+    for is_gated in gated[: deep_target_span(cap)]:
+        if assessed >= cap:
+            break
+        downloaded += 1
+        if not is_gated:
+            assessed += 1
+    return assessed, downloaded
 
 
 def select_deep_targets(rows, summaries: dict[str, dict], limit: int) -> list[str]:

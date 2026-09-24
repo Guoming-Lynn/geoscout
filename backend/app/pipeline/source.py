@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 
-from app.pipeline.lexicon import lexicon_terms
+from app.pipeline.lexicon import TISSUE_SYNONYMS, lexicon_terms
 
 
 _NAMED_LINES = (
@@ -16,11 +16,15 @@ _CELL_LINE = re.compile(
     re.I,
 )
 _XENOGRAFT = re.compile(r"xenograft|\bpdx\b|\bcdx\b|异种移植", re.I)
-_ORGANOID = re.compile(r"organoid|类器官", re.I)
+_ORGANOID = re.compile(
+    r"organoid|类器官|colonoids?|enteroids?|tumou?roids?|spheroids?|assembloids?|"
+    r"organ[- ]on[- ]a?[- ]?chips?|(?:colon|gut|intestine|lung|liver|kidney)[- ]chips?",
+    re.I,
+)
 _CULTURE = re.compile(
     r"\bcultured\b|culture medium|cell[- ]cultures?|"
     r"in[ -]?vitro\s+cultures?|(?:grown|maintained|expanded)\s+in[ -]?vitro|"
-    r"培养",
+    r"培养|\bpassage\s*\d+",
     re.I,
 )
 _ASSAY_PROTOCOL_KIND = re.compile(
@@ -128,6 +132,8 @@ def source_kind(sample: dict) -> str | None:
     primary = _unnegated(_PRIMARY, material)
     if kinds and primary:
         return None
+    if "organoid" in kinds and kinds <= {"organoid", "cell_line"}:
+        return "organoid"
     if len(kinds) > 1:
         return None
     if kinds:
@@ -137,7 +143,25 @@ def source_kind(sample: dict) -> str | None:
         return None
     if _unnegated(_PRIMARY, material) or _unnegated(_PRIMARY, _extract_protocol(sample)):
         return "primary"
+    if _tissue_material_primary(sample):
+        return "primary"
     return None
+
+
+def _tissue_material_primary(sample: dict) -> bool:
+    """A named organ in the material fields is primary when nothing says it was cultured or modeled."""
+    blob = _tissue_values(sample, include_extract=False)
+    if not blob.strip():
+        return False
+    material = _material_text(sample)
+    protocol = _protocol_for_culture(sample)
+    if _model_kinds(material) or _model_kinds(protocol) or _model_kinds(blob):
+        return False
+    if _unnegated(_CULTURE, material) or _unnegated(_CULTURE, protocol) or _unnegated(_CULTURE, blob):
+        return False
+    if _blob_has_tissue(blob, list(TISSUE_SYNONYMS)):
+        return True
+    return bool(re.search(r"tumou?rs?|resection|surgical specimen|mucosa", blob, re.I))
 
 
 def _tissue_values(sample: dict, *, include_extract: bool) -> str:
@@ -146,7 +170,7 @@ def _tissue_values(sample: dict, *, include_extract: bool) -> str:
         key = str(row.get("key") or "").casefold() if isinstance(row, dict) else ""
         if key in {"tissue", "organ", "tissue type", "tissue_type"} or any(
             part in key for part in ("cell type", "cell_type", "celltype", "cell population", "sample type")
-        ):
+        ) or _is_site_key(key):
             values.append(str(row.get("value") or row.get("raw") or ""))
     if include_extract:
         values.append(_extract_protocol(sample))
@@ -194,14 +218,31 @@ def _pbmc_subset(sample: dict, tissues: list[str]) -> bool:
 
 
 def tissue_matches(sample: dict, tissues: list[str]) -> bool:
-    """Material fields win. Extract protocol can add a tissue only when those fields do not name another organ."""
+    """Material fields win. Extract protocol can add a tissue only when those fields name no organ."""
     if _pbmc_subset(sample, tissues):
         return False
     if _material_has_tissue(sample, tissues):
         return True
     if _material_conflicts(sample, tissues):
         return False
+    if _material_names_other_organ(sample, tissues):
+        return False
     return _blob_has_tissue(_tissue_values(sample, include_extract=True), tissues)
+
+
+def _material_names_other_organ(sample: dict, tissues: list[str]) -> bool:
+    """A named organ outside the requested family blocks the extract-protocol fallback."""
+    blob = _tissue_values(sample, include_extract=False)
+    family: set[str] = set()
+    for seed in tissues:
+        family |= TISSUE_FAMILY.get(seed.casefold(), {seed.casefold()})
+    outside: list[str] = []
+    for key, values in TISSUE_SYNONYMS.items():
+        if key.casefold() in family:
+            continue
+        outside.append(key)
+        outside.extend(values)
+    return _blob_has_tissue(blob, outside)
 
 
 _OFF_TISSUE = {
@@ -218,7 +259,41 @@ _OFF_TISSUE = {
     "kidney": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
     "synovium": ["blood", "pbmc", "brain", "muscle", "adipose"],
     "skeletal muscle": ["blood", "pbmc", "brain", "synovial", "adipose"],
+    "breast": ["blood", "pbmc", "lung", "liver", "brain", "bone", "bone marrow", "lymph node", "pleural effusion", "ascites", "skin", "ovary", "colon"],
 }
+
+# Synonym families. A requested member must not treat its relatives as a different organ.
+TISSUE_FAMILY = {
+    "intestine": {"intestine", "colon", "gut"},
+    "colon": {"intestine", "colon", "gut"},
+    "gut": {"intestine", "colon", "gut"},
+    "blood": {"blood", "pbmc"},
+    "pbmc": {"blood", "pbmc"},
+    "brain": {"brain"},
+}
+
+
+def _is_site_key(key: str) -> bool:
+    folded = key.casefold()
+    if re.search(r"\b(?:region|location|site|anatom|biopsy)\b", folded):
+        return True
+    return "region" in folded or "location" in folded or "anatom" in folded or "biopsy" in folded
+
+
+def _conflict_terms(tissues: list[str]) -> list[str]:
+    offs: list[str] = []
+    for seed in tissues:
+        listed = _OFF_TISSUE.get(seed.casefold(), _OFF_TISSUE.get(seed))
+        if listed:
+            offs.extend(listed)
+            continue
+        family = TISSUE_FAMILY.get(seed.casefold(), {seed.casefold()})
+        for key, values in TISSUE_SYNONYMS.items():
+            if key.casefold() in family:
+                continue
+            offs.append(key)
+            offs.extend(values)
+    return offs
 
 
 def _material_conflicts(sample: dict, tissues: list[str]) -> bool:
@@ -229,13 +304,30 @@ def _material_conflicts(sample: dict, tissues: list[str]) -> bool:
     blob = _tissue_values(sample, include_extract=False)
     if not blob.strip():
         return False
-    offs: list[str] = []
-    for seed in tissues:
-        offs.extend(_OFF_TISSUE.get(seed.casefold(), []))
-        offs.extend(_OFF_TISSUE.get(seed, []))
+    offs = _conflict_terms(tissues)
     return any(re.search(r"(?<!\w)" + re.escape(term.casefold()) + r"(?!\w)", blob) for term in offs if term)
 
 
 def sample_tissue_conflicts(sample: dict, tissues: list[str]) -> bool:
     """True when sample material fields name a different organ than the requested tissue."""
     return _material_conflicts(sample, tissues)
+
+
+_SORTED_EXTRA = re.compile(
+    r"\bepithelial\b|\bfibroblasts?\b|\bendothelial\b|\bstromal\b|\bimmune cells?\b|\bleukocytes?\b|\bcd45\s*\+",
+    re.I,
+)
+
+
+def sorted_fraction(sample: dict) -> str | None:
+    """A purified cell population taken out of a tissue, when the user asked for the tissue itself."""
+    values = _cell_type_values(sample)
+    source = str(sample.get("source_name") or "")
+    if source:
+        values.append(source)
+    for value in values:
+        cleaned = _DEPLETED_RE.sub(" ", value)
+        match = _PBMC_SUBSET_RE.search(cleaned) or _SORTED_EXTRA.search(cleaned)
+        if match:
+            return value.strip()
+    return None

@@ -1048,6 +1048,9 @@ def merge_final(
                 )
             )
             continue
+        if _rule_covers_unverified_quote(criterion, rule, f_item, v_item):
+            merged.append(rule)
+            continue
         if _rule_standalone(rule):
             merged.append(rule)
             continue
@@ -1067,6 +1070,27 @@ def merge_final(
     for item in merged:
         _guard_subset_failure(item, spec, samples, study)
     return merged, conflicts, review_complete, model_invalid
+
+
+def _demoted_for_quote(item: CriterionJudgement | None) -> bool:
+    return item is not None and item.verdict == "unknown" and (item.reason or "").startswith("引句无法在证据")
+
+
+def _rule_covers_unverified_quote(
+    criterion,
+    rule: CriterionJudgement,
+    first: CriterionJudgement | None,
+    verify: CriterionJudgement | None,
+) -> bool:
+    """A sample-level disease pass stands when a model pass was dropped only because its quote missed."""
+    if criterion.field != "disease":
+        return False
+    if rule.verdict != "pass" or rule.clue_only or not rule.qualifying_gsms or not rule.support_text:
+        return False
+    seen = [item for item in (first, verify) if item is not None]
+    if not seen or not any(_demoted_for_quote(item) for item in seen):
+        return False
+    return all(item.verdict == "pass" or _demoted_for_quote(item) for item in seen)
 
 
 def _demoted_for_coverage(item: CriterionJudgement | None) -> bool:

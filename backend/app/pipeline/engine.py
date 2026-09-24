@@ -35,7 +35,8 @@ from app.pipeline.assessment import (
 from app.pipeline.budget import BudgetStop, check_before_external, estimate_tokens, note_pause, review_token_reserve
 from app.pipeline.donors import donors_per_group, infer_group_label
 from app.pipeline.query_planner import plan_queries
-from app.pipeline.ranking import relevance, select_deep_targets
+from app.pipeline.ranking import deep_target_span, relevance, select_deep_targets
+from app.pipeline.source import sorted_fraction
 from app.pipeline.repo import (
     add_event,
     bump_counters,
@@ -490,8 +491,7 @@ class Engine:
             datasets = (await self.session.execute(select(Dataset).join(RunDataset, RunDataset.gse == Dataset.gse).where(RunDataset.run_id == run.id))).scalars().all()
             summaries = {d.gse: _screen_summary(d) for d in datasets}
             cap = budget.max_deep_verify
-            extra = 0 if cap <= 0 else max(2, cap // 2)
-            checkpoint["deep_targets"] = select_deep_targets(rows, summaries, cap + extra)
+            checkpoint["deep_targets"] = select_deep_targets(rows, summaries, deep_target_span(cap))
             for row in rows:
                 first = load(row.first_assess_json, {})
                 selection = first.setdefault("selection", {})
@@ -1245,6 +1245,37 @@ def _single_cell_gsm_note(cohort: list[dict[str, Any]]) -> str:
     return "一个 GSM 多半是一个细胞而不是一位供体，队列规模不能按 GSM 数理解。"
 
 
+def _sorted_fraction_note(cohort: list[dict[str, Any]], spec: ResearchSpec) -> str:
+    if not cohort:
+        return ""
+    named = [hit for hit in (sorted_fraction(sample) for sample in cohort) if hit]
+    if len(named) * 2 <= len(cohort):
+        return ""
+    shown = named[0]
+    if shown.casefold() in (spec.original_request or "").casefold():
+        return ""
+    return f"样本是从组织中分选的 {shown}，不是整块组织，请确认是否符合需求。"
+
+
+def _activity_mix_note(cohort: list[dict[str, Any]], labels: dict[str, str]) -> str:
+    active = inactive = False
+    for sample in cohort:
+        gsm = str(sample.get("gsm") or "").upper()
+        if labels.get(gsm) not in {"case", "lesion", "disease"}:
+            continue
+        for row in sample.get("characteristics") or []:
+            if not isinstance(row, dict):
+                continue
+            value = str(row.get("value") or "").casefold()
+            if re.search(r"\binactive\b|缓解", value):
+                inactive = True
+            elif re.search(r"\bactive\b|活动", value):
+                active = True
+    if active and inactive:
+        return "病例组混有活动期与缓解期样本。"
+    return ""
+
+
 def _annotate_reason(
     reason: str,
     rd: RunDataset,
@@ -1303,6 +1334,12 @@ def _annotate_reason(
                     small = "每组样本很少，统计效力有限。"
                     if small not in text:
                         extra.append(small)
+                for note in (
+                    _sorted_fraction_note(cohort_samples, spec),
+                    _activity_mix_note(cohort_samples, labels),
+                ):
+                    if note and note not in text:
+                        extra.append(note)
     if rd.independent_donors is None and rd.biosample_count:
         donor = f"独立供体字段不完整；{rd.biosample_count} 个 BioSample 只是未去重的上限。"
         if donor not in text:
