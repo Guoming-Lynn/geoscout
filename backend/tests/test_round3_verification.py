@@ -105,6 +105,27 @@ def test_sorted_t_cell_subsets_are_not_pbmc():
         assert all(tissue_matches(sample, ra.tissues) for sample in samples)
 
 
+@pytest.mark.parametrize(
+    ("value", "kept"),
+    [
+        ("T cell-depleted PBMC", True),
+        ("PBMC depleted of monocytes", True),
+        ("CD14-depleted PBMCs", True),
+        ("CD45+ PBMC", True),
+        ("CD4+ T cells from PBMC", False),
+        ("sorted CD14 monocytes", False),
+    ],
+)
+def test_depleted_pbmc_is_still_pbmc(value, kept):
+    ra = heuristic_parse(RA)
+    sample = {
+        "gsm": "GSM1",
+        "source_name": "PBMC",
+        "characteristics": [{"key": "cell type", "value": value}],
+    }
+    assert tissue_matches(sample, ra.tissues) is kept
+
+
 def test_repeated_preparations_of_one_donor_are_flagged():
     text = _reason(heuristic_parse(T2D), "GSE86468")
     assert "疑似同一供体的多份样本" in text

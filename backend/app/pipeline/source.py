@@ -165,7 +165,12 @@ def _material_has_tissue(sample: dict, tissues: list[str]) -> bool:
 _PBMC_SUBSET_RE = re.compile(
     r"\bsorted\b|\bt[\s\-]?cells?\b|\bb[\s\-]?cells?\b|\bnk[\s\-]?cells?\b|"
     r"\btfh\b|\btscm\b|\btregs?\b|\bth\d+\b|\btemra\b|follicular helper|regulatory t|memory t|naive t|"
-    r"\bmonocytes?\b|\bmacrophages?\b|\bdendritic\b|\bneutrophils?\b|\bplasmablasts?\b|\bcd\d+\s*\+?",
+    r"\bmonocytes?\b|\bmacrophages?\b|\bdendritic\b|\bneutrophils?\b|\bplasmablasts?\b|\bcd(?!45\b)\d+\s*\+?",
+    re.I,
+)
+# "T cell-depleted PBMC" names what was removed, not what was kept.
+_DEPLETED_RE = re.compile(
+    r"(?:\b[\w+]+\s+)?[\w+]+[\s\-]+depleted\b(?!\s+of\b)|\bdepleted\s+of\s+[\w+]+(?:\s+cells?)?",
     re.I,
 )
 
@@ -185,7 +190,7 @@ def _pbmc_subset(sample: dict, tissues: list[str]) -> bool:
     """A sorted lymphocyte/myeloid fraction is not a PBMC sample."""
     if not any(t.casefold() in {"pbmc", "pbmcs"} for t in tissues):
         return False
-    return any(_PBMC_SUBSET_RE.search(value) for value in _cell_type_values(sample))
+    return any(_PBMC_SUBSET_RE.search(_DEPLETED_RE.sub(" ", value)) for value in _cell_type_values(sample))
 
 
 def tissue_matches(sample: dict, tissues: list[str]) -> bool:
