@@ -28,6 +28,7 @@ from app.pipeline.assay import mixed_omics_note
 from app.pipeline.assessment import (
     CheckedAssessment,
     _organism_ok,
+    _sample_fits_all_hard,
     bind_rule_evidence,
     check_model_assessment,
     fit_samples,
@@ -843,7 +844,9 @@ class Engine:
             rd.reason = kept.reason or reason
         else:
             rd.category, rd.reason = category, reason
-        rd.reason = _annotate_reason(rd.reason, rd, summary, sample_dicts, spec=spec, merged=merged)
+        rd.reason = _annotate_reason(
+            rd.reason, rd, summary, sample_dicts, spec=spec, merged=merged, rules=rules
+        )
         score, coverage_score, _ = soft_score(spec, merged)
         if rd.category == "needs_review" and rd.concerns and rd.concerns.startswith("模型请求失败") and kept is None:
             rd.reason = rd.concerns
@@ -1339,6 +1342,126 @@ def _mixed_species_note(samples: list[dict[str, Any]], spec: ResearchSpec | None
     return f"系列混有其他物种（{names} 个 GSM），结论只覆盖目标物种的 {kept} 个 GSM。"
 
 
+_BATCH_KEY = re.compile(
+    r"\b(?:batch|run|lane|flowcell|plate)\b|flow cell|sequencing date|library[_ ]prep[_ ]date|processing date",
+    re.I,
+)
+_QC_VALUE = re.compile(r"^(?:dropped|excluded|failed qc|qc fail(?:ed)?|low quality|removed)$", re.I)
+_QC_KEY = re.compile(r"qc|pass_qc|in_.*filtered", re.I)
+_QC_FAIL = re.compile(r"^(?:false|fail|no)$", re.I)
+_RAW_WITHHELD = re.compile(
+    r"raw (?:data|files?|reads?|sequenc\w*)\b.{0,80}\b(?:not|were not|was not|are not)\b.{0,40}\b(?:submitted|deposited|available|provided|uploaded)",
+    re.I,
+)
+_CONTROLLED_ACCESS = re.compile(
+    r"\b(?:dbgap|ega|egas\d+|phs\d{6}|controlled[- ]access|restricted access|data use agreement)\b",
+    re.I,
+)
+
+
+def _ordered_labels(counts: dict[str, int]) -> list[str]:
+    return sorted(counts, key=lambda label: (0 if label in {"case", "lesion", "disease"} else 1, label))
+
+
+def _rule_group_counts(
+    samples: list[dict[str, Any]],
+    spec: ResearchSpec,
+    summary: dict[str, Any],
+    rules: list[CriterionJudgement],
+) -> dict[str, int] | None:
+    groups = next(
+        (item for item in rules if item.criterion_id == "groups" and item.verdict == "pass" and item.qualifying_gsms),
+        None,
+    )
+    if groups is None:
+        return None
+    listed = {str(gsm).upper() for gsm in groups.qualifying_gsms}
+    counts: dict[str, int] = {}
+    for sample in samples:
+        gsm = str(sample.get("gsm") or "").upper()
+        if gsm not in listed or not _sample_fits_all_hard(sample, spec, summary, rules):
+            continue
+        label = infer_group_label(sample, spec=spec)
+        if label:
+            counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _batch_confound_note(cohort: list[dict[str, Any]], labels: dict[str, str]) -> str:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for sample in cohort:
+        label = labels.get(str(sample.get("gsm") or "").upper())
+        if label:
+            grouped.setdefault(label, []).append(sample)
+    usable = {label: rows for label, rows in grouped.items() if len(rows) >= 3}
+    if len(usable) < 2:
+        return ""
+    seen: list[str] = []
+    for sample in cohort:
+        for key in _char_map(sample):
+            if key not in seen and _BATCH_KEY.search(key):
+                seen.append(key)
+    chosen = ""
+    for key in seen:
+        values = {_char_map(sample).get(key, "") for rows in usable.values() for sample in rows}
+        values.discard("")
+        if len(values) >= 2:
+            chosen = key
+            break
+    if not chosen:
+        return ""
+    dist = {
+        label: Counter(value for sample in rows if (value := _char_map(sample).get(chosen, "")))
+        for label, rows in usable.items()
+    }
+    sets = [set(counts) for counts in dist.values() if counts]
+    if len(sets) >= 2 and not set.intersection(*sets):
+        return f"批次与分组完全重合（按“{chosen}”）：组间差异无法与批次效应区分。"
+    best: tuple[float, str, str] | None = None
+    for label, counts in dist.items():
+        total = sum(counts.values())
+        for value, count in counts.items():
+            if not total or count / total < 0.5:
+                continue
+            for other in dist:
+                other_total = sum(dist[other].values())
+                if other == label or not other_total:
+                    continue
+                other_share = dist[other].get(value, 0) / other_total
+                if other_share <= 0.1:
+                    gap = count / total - other_share
+                    if best is None or gap > best[0]:
+                        best = (gap, label, value)
+    if best:
+        return f"批次与分组部分重合（按“{chosen}”）：{best[1]} 多在 {best[2]}，建议把批次纳入模型。"
+    return ""
+
+
+def _qc_dropped_note(samples: list[dict[str, Any]]) -> str:
+    dropped = 0
+    example = ""
+    for sample in samples:
+        for row in sample.get("characteristics") or []:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key") or "")
+            value = str(row.get("value") or "").strip()
+            if _QC_VALUE.match(value) or (_QC_KEY.search(key) and _QC_FAIL.match(value)):
+                dropped += 1
+                example = example or f"{key}: {value}"
+                break
+    if not dropped:
+        return ""
+    return f"{dropped}/{len(samples)} 个 GSM 被提交者标为质控剔除（“{example}”），下载后应按该字段过滤。"
+
+
+def _raw_access_note(summary: dict[str, Any]) -> str:
+    text = " ".join(str(summary.get(key) or "") for key in ("title", "summary", "overall_design"))
+    if _RAW_WITHHELD.search(text) or _CONTROLLED_ACCESS.search(text):
+        return "提交者说明原始测序数据未公开或需受控申请，GEO 上通常只有处理后矩阵。"
+    return ""
+
+
 def _annotate_reason(
     reason: str,
     rd: RunDataset,
@@ -1347,6 +1470,7 @@ def _annotate_reason(
     *,
     spec: ResearchSpec | None = None,
     merged: list[CriterionJudgement] | None = None,
+    rules: list[CriterionJudgement] | None = None,
 ) -> str:
     extra: list[str] = []
     text = reason or ""
@@ -1380,9 +1504,19 @@ def _annotate_reason(
                     if sample.get("donor_key"):
                         donors.setdefault(label, set()).add(str(sample["donor_key"]))
             if counts:
-                ordered = sorted(counts, key=lambda label: (0 if label in {"case", "lesion", "disease"} else 1, label))
+                ordered = _ordered_labels(counts)
                 shown = " / ".join(f"{label} {counts[label]}" for label in ordered)
                 cohort = f"适用队列：{shown} 个 GSM。"
+                if rules:
+                    rule_counts = _rule_group_counts(samples, spec, summary, rules)
+                    if rule_counts and any(
+                        rule_counts.get(label, 0) > counts.get(label, 0)
+                        for label in set(rule_counts) | set(counts)
+                    ):
+                        rule_shown = " / ".join(
+                            f"{label} {rule_counts[label]}" for label in _ordered_labels(rule_counts)
+                        )
+                        cohort = f"适用队列：{shown} 个 GSM（模型列出）；按样本字段规则为 {rule_shown}，差异样本请人工确认。"
                 if cohort not in text:
                     extra.append(cohort)
                 if all(sample.get("donor_key") for sample in cohort_samples):
@@ -1406,9 +1540,13 @@ def _annotate_reason(
                 for note in (
                     _sorted_fraction_note(cohort_samples, spec),
                     _activity_mix_note(cohort_samples, labels),
+                    _batch_confound_note(cohort_samples, labels),
                 ):
                     if note and note not in text:
                         extra.append(note)
+    for note in (_qc_dropped_note(samples), _raw_access_note(summary)):
+        if note and note not in text:
+            extra.append(note)
     if rd.independent_donors is None and rd.biosample_count:
         donor = f"独立供体字段不完整；{rd.biosample_count} 个 BioSample 只是未去重的上限。"
         if donor not in text:

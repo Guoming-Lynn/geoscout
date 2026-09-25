@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.schemas.spec import CriterionJudgement, ResearchSpec
 from app.pipeline.lexicon import lexicon_terms
+
+logger = logging.getLogger("geoscout.donors")
 
 LESION_TOKENS = {
     "lesion",
@@ -136,7 +139,13 @@ _BASELINE_TREATMENT = {
 }
 _CLINICAL_DRUG = re.compile(
     r"methotrexate|infliximab|adalimumab|vedolizumab|ustekinumab|azathioprine|"
-    r"mesalamine|prednisolone|prednisone|steroid|insulin|metformin",
+    r"mesalamine|prednisolone|prednisone|steroid|insulin|metformin|"
+    r"5[\s\-]?asa|corticosteroid|\bcs[\s\-]?(?:oral|iv)\b|anti[\s\-]?tnf|biologic|immunomodulator",
+    re.I,
+)
+# Patient-level therapy fields describe the donor's care, not a dish treatment.
+_CLINICAL_TREATMENT_KEY = re.compile(
+    r"initial|induction|maintenance|current|prior|previous|history|baseline|at diagnosis|clinical|medication|therapy",
     re.I,
 )
 _BASELINE_PREFIX = re.compile(r"^(?:no|without|un|non)(?:\s|$)")
@@ -247,6 +256,8 @@ def parse_sample_traits(sample: dict[str, Any], *, spec: ResearchSpec | None = N
                 piece.update(control_token=True, disease_state="absent")
         if _is_treatment_key(key):
             kind = _treatment_kind(text)
+            if kind == "ex_vivo" and _CLINICAL_TREATMENT_KEY.search(key) and not _EXVIVO_RE.search(text):
+                kind = None
             if kind:
                 piece["treatment"] = kind
             elif folded not in {"treated", "untreated"}:
@@ -391,6 +402,7 @@ def _treatment_kind(value: str) -> str | None:
         return None
     if _EXVIVO_RE.search(value):
         return "ex_vivo"
+    logger.debug("treatment fallback ex_vivo: %s", value)
     return "ex_vivo"
 
 
