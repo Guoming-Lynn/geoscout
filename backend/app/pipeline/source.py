@@ -248,7 +248,7 @@ def _material_names_other_organ(sample: dict, tissues: list[str]) -> bool:
 _OFF_TISSUE = {
     "brain": ["blood", "pbmc", "heart", "liver", "intestine", "colon", "gut", "synovial", "adipose", "olfactory epithelium", "nasal", "olfactory mucosa"],
     "intestine": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
-    "colon": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
+    "colon": ["blood", "pbmc", "brain", "liver", "heart", "islet", "ileum", "ileal", "terminal ileum", "small intestine", "回肠"],
     "gut": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
     "pancreatic islets": ["blood", "pbmc", "brain", "heart", "liver", "adipose", "synovial", "muscle"],
     "plaque": ["blood", "pbmc"],

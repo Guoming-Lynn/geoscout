@@ -980,6 +980,9 @@ def merge_final(
     conflicts: list[dict[str, Any]] = []
     merged: list[CriterionJudgement] = []
     rule_map = {j.criterion_id: j for j in rules}
+    model_items = list(first_map.values()) + list(verify_map.values())
+    model_truncated = any(_demoted_for_coverage(j) for j in model_items)
+    model_seen = {str(g).upper() for j in model_items for g in j.qualifying_gsms or [] if g}
     for criterion in spec.inclusion_criteria:
         rule = rule_map.get(criterion.criterion_id) or CriterionJudgement(
             criterion_id=criterion.criterion_id,
@@ -1035,7 +1038,7 @@ def merge_final(
                     )
                 )
             else:
-                merged.append(chosen)
+                merged.append(_extend_to_unseen(chosen, rule, model_truncated, model_seen))
             continue
         if _rule_covers_truncated_model(criterion, rule, f_item, v_item, samples, spec):
             merged.append(
@@ -1091,6 +1094,32 @@ def _rule_covers_unverified_quote(
     if not seen or not any(_demoted_for_quote(item) for item in seen):
         return False
     return all(item.verdict == "pass" or _demoted_for_quote(item) for item in seen)
+
+
+def _extend_to_unseen(
+    chosen: CriterionJudgement,
+    rule: CriterionJudgement,
+    truncated: bool,
+    seen: set[str],
+) -> CriterionJudgement:
+    """A truncated model pass only speaks for the GSMs it saw; the full-sample rule covers the rest.
+
+    GSMs the model saw but left out stay out.
+    """
+    if not truncated or chosen.verdict != "pass" or not chosen.qualifying_gsms:
+        return chosen
+    if rule.verdict != "pass" or rule.clue_only or not rule.qualifying_gsms:
+        return chosen
+    listed = {str(g).upper() for g in chosen.qualifying_gsms}
+    unseen = [g for g in rule.qualifying_gsms if str(g).upper() not in seen and str(g).upper() not in listed]
+    if not unseen:
+        return chosen
+    return chosen.model_copy(
+        update={
+            "qualifying_gsms": list(chosen.qualifying_gsms) + unseen,
+            "reason": (chosen.reason or "") + f" 模型未看到的 {len(unseen)} 个 GSM 按全样本规则补入。",
+        }
+    )
 
 
 def _demoted_for_coverage(item: CriterionJudgement | None) -> bool:

@@ -14,6 +14,7 @@ _OFF_TARGET = {
     "pbmc": ["brain", "cortex", "hippocampus", "heart", "liver", "islet", "intestine", "colon", "synovial", "synovium", "adipose", "muscle"],
     "blood": ["brain", "cortex", "hippocampus", "heart", "liver", "islet", "intestine", "colon", "synovial", "adipose"],
     "intestine": ["blood", "pbmc", "heart", "brain", "liver", "islet"],
+    "colon": ["blood", "pbmc", "heart", "brain", "liver", "islet", "ileum", "ileal"],
     "colon": ["blood", "pbmc", "heart", "brain", "liver", "islet"],
     "lung": ["blood", "pbmc", "brain", "liver", "heart", "islet"],
     "liver": ["blood", "pbmc", "brain", "lung", "heart", "islet"],

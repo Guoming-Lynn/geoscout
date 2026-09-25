@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from app.evidence.store import add_evidence, evidence_bundle, new_id, write_snap
 from app.pipeline.assay import mixed_omics_note
 from app.pipeline.assessment import (
     CheckedAssessment,
+    _organism_ok,
     bind_rule_evidence,
     check_model_assessment,
     fit_samples,
@@ -1185,13 +1187,18 @@ def _title_individual_count(samples: list[dict[str, Any]]) -> int | None:
     # One-cell-per-GSM series carry chip/well/index codes in titles, not individuals.
     if len(samples) > 200:
         return None
-    noise = re.compile(r"utx|lps|il-?1b|st\d+|rep\d+|r\d+$|_\d+h|(?<![A-Za-z0-9])S\d{1,3}(?![A-Za-z0-9])", re.I)
+    noise = re.compile(
+        r"utx|lps|il-?1b|st\d+|rep\d+|r\d+$|_\d+h|(?<![A-Za-z0-9])S\d{1,3}(?![A-Za-z0-9])|(?<![A-Za-z])CD\d+[a-z]?",
+        re.I,
+    )
     token = re.compile(r"[A-Za-z]{1,4}\d{1,3}")
     found: set[str] = set()
     for sample in samples:
         title = noise.sub(" ", str(sample.get("title") or ""))
         found.update(token.findall(title))
-    count = len(found)
+    # Donor codes come in series (P1, P2, ...); lone gene/antibody names (OX40, PDL1) do not.
+    prefixes = Counter(re.match(r"[A-Za-z]+", item).group().upper() for item in found)
+    count = sum(1 for item in found if prefixes[re.match(r"[A-Za-z]+", item).group().upper()] >= 2)
     if count < 2 or not samples or count > len(samples) // 2:
         return None
     return count
@@ -1317,6 +1324,21 @@ def _case_only_note(
     return "系列只有病例样本、没有对照组：可做病例内部分析，不能直接做病例-对照比较。"
 
 
+def _mixed_species_note(samples: list[dict[str, Any]], spec: ResearchSpec | None) -> str:
+    if spec is None or not spec.organisms or not samples:
+        return ""
+    other = Counter(
+        str(s.get("organism") or "").strip()
+        for s in samples
+        if _organism_ok(s, spec.organisms) is False
+    )
+    if not other:
+        return ""
+    kept = len(samples) - sum(other.values())
+    names = "、".join(f"{name} {n}" for name, n in other.most_common())
+    return f"系列混有其他物种（{names} 个 GSM），结论只覆盖目标物种的 {kept} 个 GSM。"
+
+
 def _annotate_reason(
     reason: str,
     rd: RunDataset,
@@ -1333,6 +1355,9 @@ def _annotate_reason(
     if note and note not in text:
         extra.append(note)
     note = _case_only_note(samples, spec, merged)
+    if note and note not in text:
+        extra.append(note)
+    note = _mixed_species_note(samples, spec)
     if note and note not in text:
         extra.append(note)
     if spec is not None and merged:

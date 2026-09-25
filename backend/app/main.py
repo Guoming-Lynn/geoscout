@@ -27,7 +27,23 @@ async def lifespan(_app: FastAPI):
     if settings.embed_worker:
         from app.worker import loop
 
-        worker_task = asyncio.create_task(loop(), name="geoscout-worker")
+        async def _supervise() -> None:
+            while True:
+                worker_task = asyncio.create_task(loop(), name="geoscout-worker")
+                try:
+                    await worker_task
+                except asyncio.CancelledError:
+                    worker_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await worker_task
+                    raise
+                except Exception:
+                    logger.exception("embedded worker stopped; restarting")
+                else:
+                    logger.error("embedded worker returned; restarting")
+                await asyncio.sleep(1)
+
+        worker_task = asyncio.create_task(_supervise(), name="geoscout-worker-supervisor")
         logger.info("embedded worker task started")
     logger.info("GEOScout API listening intent host=%s port=%s", settings.host, settings.port)
     try:
