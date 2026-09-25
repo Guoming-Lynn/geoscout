@@ -979,7 +979,8 @@ def merge_final(
     review_complete = first_ok and verify_ok and not (first and first.incomplete) and not (verify and verify.incomplete)
     conflicts: list[dict[str, Any]] = []
     merged: list[CriterionJudgement] = []
-    rule_map = {j.criterion_id: j for j in rules}
+    # Merging narrows GSM lists in place; the caller's rule judgements must stay whole.
+    rule_map = {j.criterion_id: j.model_copy(deep=True) for j in rules}
     model_items = list(first_map.values()) + list(verify_map.values())
     model_truncated = any(_demoted_for_coverage(j) for j in model_items)
     model_seen = {str(g).upper() for j in model_items for g in j.qualifying_gsms or [] if g}

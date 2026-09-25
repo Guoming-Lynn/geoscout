@@ -1438,21 +1438,28 @@ def _batch_confound_note(cohort: list[dict[str, Any]], labels: dict[str, str]) -
 
 
 def _qc_dropped_note(samples: list[dict[str, Any]]) -> str:
-    dropped = 0
-    example = ""
+    dropped = subset = 0
+    dropped_example = subset_example = ""
     for sample in samples:
         for row in sample.get("characteristics") or []:
             if not isinstance(row, dict):
                 continue
             key = str(row.get("key") or "")
             value = str(row.get("value") or "").strip()
-            if _QC_VALUE.match(value) or (_QC_KEY.search(key) and _QC_FAIL.match(value)):
+            if _QC_VALUE.match(value) or (re.search(r"qc", key, re.I) and _QC_FAIL.match(value)):
                 dropped += 1
-                example = example or f"{key}: {value}"
+                dropped_example = dropped_example or f"{key}: {value}"
                 break
-    if not dropped:
-        return ""
-    return f"{dropped}/{len(samples)} 个 GSM 被提交者标为质控剔除（“{example}”），下载后应按该字段过滤。"
+            if _QC_KEY.search(key) and _QC_FAIL.match(value):
+                subset += 1
+                subset_example = subset_example or f"{key}: {value}"
+                break
+    notes = []
+    if dropped:
+        notes.append(f"{dropped}/{len(samples)} 个 GSM 被提交者标为质控剔除（“{dropped_example}”），下载后应按该字段过滤。")
+    if subset:
+        notes.append(f"{subset}/{len(samples)} 个 GSM 不在提交者的分析子集里（“{subset_example}”），复现原文分析时应按该字段过滤。")
+    return " ".join(notes)
 
 
 def _raw_access_note(summary: dict[str, Any]) -> str:

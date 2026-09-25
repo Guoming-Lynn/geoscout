@@ -152,6 +152,30 @@ def test_reason_names_the_rule_cohort_when_the_model_omits_samples():
     assert "按样本字段规则" not in silent
 
 
+def test_merge_leaves_caller_rules_whole():
+    spec = heuristic_parse(UC_TEXT)
+    everyone = [f"GSM{i}" for i in range(6)]
+    rule = CriterionJudgement(
+        criterion_id="tissue", verdict="pass", reason="r", qualifying_gsms=list(everyone), support_text="colon"
+    )
+    model = [CriterionJudgement(criterion_id="groups", verdict="pass", reason="m", qualifying_gsms=everyone[:3])]
+    merge_final(spec, [rule], _assessment(model), _assessment(model), samples=[{"gsm": g} for g in everyone])
+    assert rule.qualifying_gsms == everyone
+
+
+def test_breast_subtype_tissue_labels_are_cases():
+    from app.pipeline.donors import infer_group_label
+
+    spec = heuristic_parse(BR_TEXT)
+
+    def sample(tissue, cell):
+        return {"gsm": "GSM1", "characteristics": [{"key": "tissue", "value": tissue}, {"key": "cell type", "value": cell}]}
+
+    assert infer_group_label(sample("Breast invasive carcinoma", "Breast immune cells"), spec=spec) == "case"
+    assert infer_group_label(sample("Breast carcinoma in situ", "Breast stromal cells"), spec=spec) == "case"
+    assert infer_group_label(sample("Normal mammary tissues", "Breast immune cells"), spec=spec) == "control"
+
+
 def test_batch_confound_note():
     def rows(label: str, batches: list[str]) -> tuple[list[dict], dict[str, str]]:
         samples = [{"gsm": f"{label}{i}".upper(), "characteristics": [{"key": "batch", "value": b}]} for i, b in enumerate(batches)]
@@ -177,7 +201,8 @@ def test_qc_dropped_and_raw_access_notes():
     kept = [{"gsm": "B", "characteristics": [{"key": "celltype", "value": "beta"}]}]
     subset = [{"gsm": "C", "characteristics": [{"key": "in_ins_filtered_data_subset", "value": "FALSE"}]}]
     assert _qc_dropped_note(dropped + kept) == '1/2 个 GSM 被提交者标为质控剔除（“celltype: dropped”），下载后应按该字段过滤。'
-    assert "1/1" in _qc_dropped_note(subset)
+    assert "1/1 个 GSM 不在提交者的分析子集里" in _qc_dropped_note(subset)
+    assert "不在" not in _qc_dropped_note(dropped + kept)
     assert _qc_dropped_note(kept) == ""
     withheld = {"overall_design": "Raw files for human samples were not submitted to GEO."}
     assert "未公开或需受控申请" in _raw_access_note(withheld)

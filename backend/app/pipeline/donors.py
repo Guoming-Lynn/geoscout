@@ -58,7 +58,10 @@ DISEASE_LABELS = {
     "ulcerative colitis": ["UC", "active UC", "inactive UC", "UC active", "UC inactive", "ulcerative colitis"],
     "Crohn's disease": ["CD", "Crohn", "Crohns", "Crohn's"],
     "inflammatory bowel disease": ["IBD"],
-    "breast cancer": ["BC", "BRCA", "TNBC", "IDC", "ILC", "HR+", "HER2+", "ER+", "DCIS", "tumor", "tumour"],
+    "breast cancer": [
+        "BC", "BRCA", "TNBC", "IDC", "ILC", "HR+", "HER2+", "ER+", "DCIS", "tumor", "tumour",
+        "invasive carcinoma", "carcinoma in situ", "ductal carcinoma", "lobular carcinoma", "mammary carcinoma",
+    ],
 }
 # Requesting the parent also accepts its child diseases as cases.
 DISEASE_CHILDREN = {
