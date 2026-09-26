@@ -1262,9 +1262,17 @@ def _age_mismatch_note(cohort: list[dict[str, Any]], labels: dict[str, str]) -> 
     return f"年龄段不匹配：{shown} 个 GSM 来自胎儿/儿童/青少年供体，另一组没有。"
 
 
-def _single_cell_gsm_note(cohort: list[dict[str, Any]]) -> str:
+_DROPLET_RE = re.compile(r"\b10x\b|chromium|droplet|drop-?seq|indrop|seq-?well|\bbd rhapsody\b", re.I)
+
+
+def _single_cell_gsm_note(cohort: list[dict[str, Any]], summary: dict[str, Any] | None = None) -> str:
     """One-cell-per-GSM series must not be read as one person per GSM."""
     if len(cohort) < 50 or any(sample.get("donor_key") for sample in cohort):
+        return ""
+    # Droplet platforms put a whole library (thousands of cells) in one GSM.
+    text = " ".join(str((summary or {}).get(key) or "") for key in ("summary", "overall_design"))
+    text += " ".join(str(sample.get("protocol") or "") for sample in cohort[:20])
+    if _DROPLET_RE.search(text):
         return ""
 
     single = sum("single" in str(sample.get("library_source") or "").casefold() for sample in cohort)
@@ -1534,7 +1542,7 @@ def _annotate_reason(
                     effective = {label: len(donors.get(label, ())) for label in ordered}
                 else:
                     effective = dict(counts)
-                    cell_note = _single_cell_gsm_note(cohort_samples)
+                    cell_note = _single_cell_gsm_note(cohort_samples, summary)
                     if cell_note and cell_note not in text:
                         extra.append(cell_note)
                 for note in (_repeated_sample_note(cohort_samples), _age_mismatch_note(cohort_samples, labels)):

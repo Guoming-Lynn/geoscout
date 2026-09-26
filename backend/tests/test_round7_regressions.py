@@ -176,6 +176,15 @@ def test_breast_subtype_tissue_labels_are_cases():
     assert infer_group_label(sample("Normal mammary tissues", "Breast immune cells"), spec=spec) == "control"
 
 
+def test_droplet_libraries_are_not_one_cell_per_gsm():
+    from app.pipeline.engine import _single_cell_gsm_note
+
+    cohort = [{"gsm": f"GSM{i}", "library_source": "transcriptomic single cell"} for i in range(50)]
+    assert "一个 GSM 多半是一个细胞" in _single_cell_gsm_note(cohort, {"overall_design": "Fluidigm C1 single cells"})
+    droplet = {"overall_design": "FACS sorted fractions, then droplet-based 10X scRNAseq (3'HTv3)."}
+    assert _single_cell_gsm_note(cohort, droplet) == ""
+
+
 def test_batch_confound_note():
     def rows(label: str, batches: list[str]) -> tuple[list[dict], dict[str, str]]:
         samples = [{"gsm": f"{label}{i}".upper(), "characteristics": [{"key": "batch", "value": b}]} for i, b in enumerate(batches)]
